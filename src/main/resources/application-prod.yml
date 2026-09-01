@@ -1,0 +1,19 @@
+# Production overlay.
+#
+# Sanitized error bodies and no Swagger UI. The API document itself stays disabled too:
+# publishing the surface of an internal service to anything that can reach the route is a
+# choice, not a default.
+app:
+  errors:
+    expose-detail: false
+
+springdoc:
+  swagger-ui:
+    enabled: false
+  api-docs:
+    enabled: false
+
+logging:
+  level:
+    root: WARN
+    id.co.bni: INFO

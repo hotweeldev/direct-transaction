@@ -1,0 +1,17 @@
+# Development overlay - raw exception messages and SQL logging.
+app:
+  errors:
+    expose-detail: true
+
+logging:
+  level:
+    id.co.bni: DEBUG
+    id.co.bni.direct.transaction.repository.mapper: DEBUG
+    # Per-statement timings, one line per query, carrying the correlation id from the MDC.
+    id.co.bni.direct.transaction.config.MyBatisMetricsInterceptor: DEBUG
+
+springdoc:
+  swagger-ui:
+    enabled: true
+  api-docs:
+    enabled: true

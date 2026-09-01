@@ -1,0 +1,320 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  The legacy DIRECT tables behind the maker-submit pipeline. This service creates none of
+  them; Flyway must never try (see the Flyway comments in application.yml).
+
+  SCOPE. CORP_USR has no CORP_ID column: a user belongs to a company only through
+  CORP_USR_GRP_ID -> CORP_USR_GRP.CORP_ID (the fact direct-admin's CorporateUserMapper.xml
+  documents), so the maker lookup joins the group with CORP_ID = #{companyId} rather than
+  trusting a user id that is only unique per company.
+
+  CORP_ACCT_GRP_DTL.CORP_ACCT_NO IS NOT AN ACCOUNT NUMBER. It holds CORP_ACCT.ID and the
+  column name says otherwise - the trap documented at length in direct-admin's
+  AccountGroupMapper.xml:67 (3292 of 3387 detail rows join to CORP_ACCT.ID, exactly zero
+  to ACCT_NO). Every account-chain statement here joins ca.ID = d.CORP_ACCT_NO and only
+  then compares ca.ACCT_NO.
+
+  LIMITS. BANK_TRX_LMT / CORP_LMT_PC_DTL / CORP_USR_GRP_LMT all hang off the service-
+  currency matrix (COM_ST_SRVC_CCY_MTRX -> COM_ST_SRVC_CCY carries SRVC_CD), the joins
+  direct-bankmodule's LimitCatalogMapper.xml walks. The matrix cell codes (LL/LF/FS/...)
+  are currency-CATEGORY pairs, not currency codes; the limit rows carry their own CCY_CD,
+  so the cell pins the service and CCY_CD pins the currency. FETCH FIRST 1 ROWS ONLY on
+  each: nothing in the legacy schema makes these rows unique per (service, currency) and
+  live duplicates exist (LimitCatalogMapper documents 77 duplicated corp pairs).
+
+  Legacy columns are NVARCHAR2, so every literal compared against one is written N'...' -
+  a plain 'Y' next to an NVARCHAR2 column raises ORA-12704 (character set mismatch).
+-->
+<mapper namespace="id.co.bni.direct.transaction.repository.mapper.TransferMapper">
+
+    <!--
+      The maker in one read: identity, group, account group, workflow role pair, auth type.
+      GCM_ST_APRV_MAP is LEFT joined - a user with no approval map is still found, and the
+      service answers NOT_MAKER off the null role rather than a misleading "user not found".
+      SPI_GE_USER is LEFT joined for the display name: CORP_USR has no name column of its
+      own, 853 of 855 rows carry their own ID in SPI_USR_CD (the FK to SPI_GE_USER was
+      dropped - CorporateUserMapper.xml documents it), so the join usually misses and the
+      service falls back to the login id.
+    -->
+    <select id="findMaker" resultType="id.co.bni.direct.transaction.entity.TransferRows$MakerRow">
+        SELECT u.ID              AS "corpUserId",
+               u.USER_ID         AS "userId",
+               su.NAME           AS "userName",
+               g.ID              AS "groupId",
+               g.CORP_ACCT_GRP_ID AS "acctGroupId",
+               m.WF_ROLE_CD      AS "wfRoleCd",
+               m.APRV_LVL_CD     AS "aprvLvlCd",
+               u.AUTH_TYP_CD     AS "authTypCd"
+        FROM CORP_USR u
+        JOIN CORP_USR_GRP g
+          ON g.ID = u.CORP_USR_GRP_ID
+         AND g.CORP_ID = #{companyId}
+         AND g.IS_DELETE = N'N'
+        LEFT JOIN GCM_ST_APRV_MAP m ON m.ID = u.APRV_MAP_ID
+        LEFT JOIN SPI_GE_USER su ON su.CD = u.SPI_USR_CD
+        WHERE u.USER_ID = #{userId}
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <!-- Suspended registrations excluded with the IN (N'Y', N'1') spelling: INACTIVE_STS
+         holds inconsistent legacy values ('0', 'N', 'Y', '1'), so "suspended" is that IN
+         list, never <> N'N' (direct-account's UserAccountMapper reasoning). -->
+    <sql id="chainAccount">
+        FROM CORP_ACCT_GRP ag
+        JOIN CORP_ACCT_GRP_DTL d
+          ON d.CORP_ACCT_GRP_ID = ag.ID
+        JOIN CORP_ACCT ca
+          ON ca.ID = d.CORP_ACCT_NO
+        WHERE ag.ID = #{acctGroupId}
+          AND ag.IS_DELETE = N'N'
+          AND ca.ACCT_NO = #{accountNo}
+          AND (ca.INACTIVE_STS IS NULL OR ca.INACTIVE_STS NOT IN (N'Y', N'1'))
+    </sql>
+
+    <select id="countDebitAccount" resultType="int">
+        SELECT COUNT(*)
+        <include refid="chainAccount"/>
+          AND d.IS_DEBIT = N'Y'
+    </select>
+
+    <select id="countAnyAccount" resultType="int">
+        SELECT COUNT(*)
+        <include refid="chainAccount"/>
+    </select>
+
+    <select id="findBankLimit" resultType="id.co.bni.direct.transaction.entity.TransferRows$BankLimitRow">
+        SELECT b.MIN_AMT_LMT AS "minAmtLmt",
+               b.MAX_AMT_LMT AS "maxAmtLmt"
+        FROM BANK_TRX_LMT b
+        JOIN COM_ST_SRVC_CCY_MTRX scm ON scm.ID = b.SRVC_CCY_MTRX_ID
+        JOIN COM_ST_SRVC_CCY scy      ON scy.ID = scm.SRVC_CCY_ID
+        WHERE scy.SRVC_CD = #{srvcCd}
+          AND b.CCY_CD = #{ccyCd}
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <select id="findCorpLimit" resultType="id.co.bni.direct.transaction.entity.TransferRows$UsageLimitRow">
+        SELECT v.AMT_LMT_USAGE AS "amtLmtUsage",
+               v.MAX_AMT_LMT   AS "maxAmtLmt"
+        FROM CORP_LMT_PC_DTL v
+        JOIN COM_ST_SRVC_CCY_MTRX scm ON scm.ID = v.SRVC_CCY_MTRX_ID
+        JOIN COM_ST_SRVC_CCY scy      ON scy.ID = scm.SRVC_CCY_ID
+        WHERE v.CORP_ID = #{companyId}
+          AND scy.SRVC_CD = #{srvcCd}
+          AND v.CCY_CD = #{ccyCd}
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <select id="findGroupLimit" resultType="id.co.bni.direct.transaction.entity.TransferRows$UsageLimitRow">
+        SELECT l.AMT_LMT_USAGE AS "amtLmtUsage",
+               l.MAX_AMT_LMT   AS "maxAmtLmt"
+        FROM CORP_USR_GRP_LMT l
+        JOIN COM_ST_SRVC_CCY_MTRX scm ON scm.ID = l.SRVC_CCY_MTRX_ID
+        JOIN COM_ST_SRVC_CCY scy      ON scy.ID = scm.SRVC_CCY_ID
+        WHERE l.CORP_USR_GRP_ID = #{groupId}
+          AND scy.SRVC_CD = #{srvcCd}
+          AND l.CCY_CD = #{ccyCd}
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <select id="findAccountDebitLimit" resultType="java.math.BigDecimal">
+        SELECT DEBIT_LMT
+        FROM CORP_ACCT
+        WHERE CORP_ID = #{companyId}
+          AND ACCT_NO = #{accountNo}
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <select id="findMakerSchemeLimit" resultType="java.math.BigDecimal">
+        SELECT MAKE_LMT
+        FROM AUTH_LMT_SCHEME
+        WHERE CORP_ID = #{companyId}
+          AND APRV_LVL_CD = #{aprvLvlCd}
+          AND LMT_CCY_CD = #{ccyCd}
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <!--
+      Candidate materialization's raw material: every user of the company that has a
+      workflow-role map row at all. Role/level/group-option filtering happens in Java
+      (TransferServiceImpl) so the frozen-candidate rules are unit-testable; this read
+      only bounds the set to one company. Same joins as findMaker, same SPI_GE_USER
+      caveat (the name join usually misses; the service falls back to the login id).
+    -->
+    <select id="findWorkflowUsers" resultType="id.co.bni.direct.transaction.entity.TransferRows$WorkflowUserRow">
+        SELECT u.ID          AS "corpUserId",
+               u.USER_ID     AS "userId",
+               su.NAME       AS "userName",
+               g.ID          AS "groupId",
+               m.WF_ROLE_CD  AS "wfRoleCd",
+               m.APRV_LVL_CD AS "aprvLvlCd"
+        FROM CORP_USR u
+        JOIN CORP_USR_GRP g
+          ON g.ID = u.CORP_USR_GRP_ID
+         AND g.CORP_ID = #{companyId}
+         AND g.IS_DELETE = N'N'
+        JOIN GCM_ST_APRV_MAP m ON m.ID = u.APRV_MAP_ID
+        LEFT JOIN SPI_GE_USER su ON su.CD = u.SPI_USR_CD
+    </select>
+
+    <select id="findCorpFlags" resultType="id.co.bni.direct.transaction.entity.TransferRows$CorpFlagsRow">
+        SELECT IS_CASH_LITE   AS "isCashLite",
+               IS_SINGLE_USER AS "isSingleUser"
+        FROM CORP
+        WHERE ID = #{companyId}
+    </select>
+
+    <select id="findMatrixMasterId" resultType="string">
+        SELECT ID
+        FROM CORP_APRV_MTRX_MSTR
+        WHERE CORP_ID = #{companyId}
+          AND SPI_MNU_CD = #{menuCd}
+          AND CCY_CD = #{ccyCd}
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <!-- Ascending by LONG_AMT_LMT: the order ApprovalMatrixServiceImpl relies on ("a
+         band's floor is the band below it"), so the service can take the first band whose
+         ceiling covers the amount. -->
+    <select id="findMatrixBands" resultType="id.co.bni.direct.transaction.entity.TransferRows$MatrixBandRow">
+        SELECT ID           AS "id",
+               LONG_AMT_LMT AS "longAmtLmt",
+               NO_APRV      AS "noAprv"
+        FROM CORP_APRV_MTRX_SUB
+        WHERE CORP_APRV_MTRX_MSTR_ID = #{masterId}
+        ORDER BY LONG_AMT_LMT
+    </select>
+
+    <!-- AUTH_LMT_SCHEME_ID resolves to the required approval level; the join is LEFT so a
+         detail row pointing at no scheme means "any level", which the service stores as a
+         null APRV_LVL_CD. -->
+    <select id="findBandSignatures" resultType="id.co.bni.direct.transaction.entity.TransferRows$MatrixSignatureRow">
+        SELECT d.SEQ_NO          AS "seqNo",
+               d.NO_USR          AS "noUsr",
+               s.APRV_LVL_CD     AS "aprvLvlCd",
+               d.USR_GRP_OPT     AS "usrGrpOpt",
+               d.CORP_USR_GRP_ID AS "corpUsrGrpId"
+        FROM CORP_APRV_MTRX_DTL d
+        LEFT JOIN AUTH_LMT_SCHEME s ON s.ID = d.AUTH_LMT_SCHEME_ID
+        WHERE d.CORP_APRV_MTRX_SUB_ID = #{bandId}
+        ORDER BY d.SEQ_NO
+    </select>
+
+    <!--
+      EXECUTION-TIME ceiling locks. Same resolution joins as findCorpLimit/findGroupLimit
+      (the submit validation read them the same way), but FOR UPDATE OF the limit row so
+      the ceiling re-check and the usage increment are atomic against a concurrent release
+      of another task on the same cell. ROWNUM rather than FETCH FIRST for the same reason
+      as lockRefNoValue: Oracle refuses FOR UPDATE over a row-limiting clause. The row's
+      own ID comes back so the increment targets exactly the locked row - re-running the
+      resolution could land on a different one of the documented legacy duplicates.
+    -->
+    <select id="lockCorpLimit" resultType="id.co.bni.direct.transaction.entity.TransferRows$UsageLockRow">
+        SELECT v.ID            AS "id",
+               v.AMT_LMT_USAGE AS "amtLmtUsage",
+               v.MAX_AMT_LMT   AS "maxAmtLmt"
+        FROM CORP_LMT_PC_DTL v
+        JOIN COM_ST_SRVC_CCY_MTRX scm ON scm.ID = v.SRVC_CCY_MTRX_ID
+        JOIN COM_ST_SRVC_CCY scy      ON scy.ID = scm.SRVC_CCY_ID
+        WHERE v.CORP_ID = #{companyId}
+          AND scy.SRVC_CD = #{srvcCd}
+          AND v.CCY_CD = #{ccyCd}
+          AND ROWNUM = 1
+        FOR UPDATE OF v.AMT_LMT_USAGE
+    </select>
+
+    <select id="lockGroupLimit" resultType="id.co.bni.direct.transaction.entity.TransferRows$UsageLockRow">
+        SELECT l.ID            AS "id",
+               l.AMT_LMT_USAGE AS "amtLmtUsage",
+               l.MAX_AMT_LMT   AS "maxAmtLmt"
+        FROM CORP_USR_GRP_LMT l
+        JOIN COM_ST_SRVC_CCY_MTRX scm ON scm.ID = l.SRVC_CCY_MTRX_ID
+        JOIN COM_ST_SRVC_CCY scy      ON scy.ID = scm.SRVC_CCY_ID
+        WHERE l.CORP_USR_GRP_ID = #{groupId}
+          AND scy.SRVC_CD = #{srvcCd}
+          AND l.CCY_CD = #{ccyCd}
+          AND ROWNUM = 1
+        FOR UPDATE OF l.AMT_LMT_USAGE
+    </select>
+
+    <update id="incrementCorpLimitUsage">
+        UPDATE CORP_LMT_PC_DTL
+        SET AMT_LMT_USAGE = NVL(AMT_LMT_USAGE, 0) + #{amount}
+        WHERE ID = #{id}
+    </update>
+
+    <update id="incrementGroupLimitUsage">
+        UPDATE CORP_USR_GRP_LMT
+        SET AMT_LMT_USAGE = NVL(AMT_LMT_USAGE, 0) + #{amount}
+        WHERE ID = #{id}
+    </update>
+
+    <select id="findUserGroupId" resultType="string">
+        SELECT CORP_USR_GRP_ID
+        FROM CORP_USR
+        WHERE ID = #{corpUsrId}
+    </select>
+
+    <!--
+      The legacy booking row of an executed transfer - BASE_FT by bare name, the table the
+      legacy application reads its FT history from. Minimal correct column set for an
+      immediate in-house IDR transfer per the studied fill-sheet:
+        CLASS pins the legacy Java type for this product, MNU/SRVC the menu and resolved
+        service, IDX=999 the legacy single-row marker, REF_NO the task's submit-time
+        reference, TRX_REF_NO the fresh 20-digit reference minted AT EXECUTION from
+        TRX_REF_NO_SEQUENCE, IS_PROCESSED='Y' because the core transfer has already
+        happened when this row is written. CREATED_BY is the maker's CORP_USR.ID,
+        UPDATED_BY the releaser's. CH_TYP_1_* charge columns stay NULL - charge
+        computation is a separate feature. Every unlisted column is NULL.
+      Legacy NVARCHAR2 columns again, so constant literals are N'...'.
+    -->
+    <insert id="insertBaseFt">
+        INSERT INTO BASE_FT (ID, CLASS, VERSION, MNU_CD, SRVC_CD, IDX, REF_NO, TRX_REF_NO,
+                             REM_ACCT_NO, BEN_ACCT_NO, BEN_ACCT_NM, BEN_ACCT_CCY_CD,
+                             TRX_AMT, TRX_CCY_CD, INSTRUCTION_MODE, INSTRUCTION_DT,
+                             RECUR_PARAM, RECUR_CTR, IS_PROCESSED, IS_NOTIFY_BEN,
+                             FINALIZE_PAYMENT_FLAG, CREATED_BY, CREATED_DT, UPDATED_BY)
+        VALUES (#{id}, N'com.aprisma.product.gcm.common.model.InHouseFT', 1, #{mnuCd},
+                #{srvcCd}, 999, #{refNo}, #{trxRefNo},
+                #{remAcctNo}, #{benAcctNo}, #{benAcctNm}, N'IDR',
+                #{trxAmt}, N'IDR', N'1', SYSDATE,
+                0, 0, N'Y', NULL,
+                N'N', #{createdBy}, SYSDATE, #{updatedBy})
+    </insert>
+
+    <!--
+      TRX_REF_NO_SEQUENCE is the LEGACY table, shared with the parallel legacy application
+      on purpose: both mint reference numbers from one counter, so neither can collide with
+      the other. FOR UPDATE holds the row until this transaction commits - the whole point.
+      The pair (SERVICE_CD, CORP_ID) carries no unique constraint in legacy (PK is ID
+      alone); ROWNUM = 1 tolerates a duplicated pair, at the cost of the duplicates
+      drifting - exactly what legacy already lives with. ROWNUM rather than FETCH FIRST
+      because Oracle refuses FOR UPDATE over a row-limiting clause.
+    -->
+    <select id="lockRefNoValue" resultType="java.lang.Long">
+        SELECT VALUE
+        FROM TRX_REF_NO_SEQUENCE
+        WHERE SERVICE_CD = #{srvcCd}
+          AND CORP_ID = #{corpId}
+          AND ROWNUM = 1
+        FOR UPDATE
+    </select>
+
+    <!-- ID is NOT NULL with no identity, default or trigger; RAWTOHEX(SYS_GUID()) matches
+         the 32-hex shape legacy ids carry. This table's columns are plain VARCHAR2 (no N
+         literals needed). -->
+    <insert id="insertRefNoSeq">
+        INSERT INTO TRX_REF_NO_SEQUENCE (ID, SERVICE_CD, CORP_ID, VALUE)
+        VALUES (RAWTOHEX(SYS_GUID()), #{srvcCd}, #{corpId}, #{value})
+    </insert>
+
+    <update id="updateRefNoSeq">
+        UPDATE TRX_REF_NO_SEQUENCE
+        SET VALUE = #{value}
+        WHERE SERVICE_CD = #{srvcCd}
+          AND CORP_ID = #{corpId}
+    </update>
+
+</mapper>

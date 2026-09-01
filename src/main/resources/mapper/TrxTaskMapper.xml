@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  TRX_TASK / TRX_TASK_STAGE / TRX_TASK_ACTION / TRX_TASK_CANDIDATE - the tables this
+  service owns (V1 + V2). Ids are minted in Java (32-hex, dashless), VERSION starts at 0,
+  INSTRUCTION_DT and the audit timestamps come from SYSDATE at insert so every environment
+  stamps database time.
+
+  These tables are NVARCHAR2 like the legacy schema they sit next to, so status literals
+  compared in SQL are written N'...' (a plain literal risks ORA-12704).
+-->
+<mapper namespace="id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper">
+
+    <insert id="insertTask">
+        INSERT INTO TRX_TASK (ID, CORP_ID, MENU_CD, SRVC_CD, REF_NO, STATUS,
+                              CURRENT_STAGE_SEQ, REM_ACCT_NO, BEN_ACCT_NO, BEN_ACCT_NM,
+                              TRX_AMT, TRX_CCY_CD, REMARK1, REMARK2, REMARK3,
+                              INSTRUCTION_MODE, INSTRUCTION_DT, MAKER_USER_ID,
+                              MAKER_USER_NAME, IS_SINGLE_USER, VERSION, CREATED_BY, CREATED_DT)
+        VALUES (#{id}, #{corpId}, #{menuCd}, #{srvcCd}, #{refNo}, #{status},
+                #{currentStageSeq}, #{remAcctNo}, #{benAcctNo}, #{benAcctNm},
+                #{trxAmt}, #{trxCcyCd}, #{remark1}, #{remark2}, #{remark3},
+                #{instructionMode}, SYSDATE, #{makerUserId},
+                #{makerUserName}, #{isSingleUser}, 0, #{createdBy}, SYSDATE)
+    </insert>
+
+    <insert id="insertStage">
+        INSERT INTO TRX_TASK_STAGE (ID, TRX_TASK_ID, SEQ_NO, STAGE_TYPE, APRV_LVL_CD,
+                                    USR_GRP_OPT, CORP_USR_GRP_ID, REQUIRED_COUNT,
+                                    COMPLETED_COUNT, STATUS, VERSION, CREATED_BY, CREATED_DT)
+        VALUES (#{id}, #{trxTaskId}, #{seqNo}, #{stageType}, #{aprvLvlCd},
+                #{usrGrpOpt}, #{corpUsrGrpId}, #{requiredCount},
+                0, #{status}, 0, #{createdBy}, SYSDATE)
+    </insert>
+
+    <insert id="insertAction">
+        INSERT INTO TRX_TASK_ACTION (ID, TRX_TASK_ID, STAGE_SEQ, ACTION, ACTOR_USER_ID,
+                                     ACTOR_USER_NAME, ACTOR_GROUP_ID, OTP_VERIFICATION_ID,
+                                     NOTE, CREATED_DT)
+        VALUES (#{id}, #{trxTaskId}, #{stageSeq}, #{action}, #{actorUserId},
+                #{actorUserName}, #{actorGroupId}, #{otpVerificationId},
+                #{note}, SYSDATE)
+    </insert>
+
+    <insert id="insertCandidate">
+        INSERT INTO TRX_TASK_CANDIDATE (ID, TRX_TASK_ID, STAGE_SEQ, USER_ID, CORP_USR_ID,
+                                        USER_NAME, CORP_USR_GRP_ID, CREATED_BY, CREATED_DT)
+        VALUES (#{id}, #{trxTaskId}, #{stageSeq}, #{userId}, #{corpUsrId},
+                #{userName}, #{corpUsrGrpId}, #{createdBy}, SYSDATE)
+    </insert>
+
+    <select id="findTask" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$TaskRow">
+        SELECT ID                AS "id",
+               REF_NO            AS "refNo",
+               MENU_CD           AS "menuCd",
+               STATUS            AS "status",
+               CURRENT_STAGE_SEQ AS "currentStageSeq",
+               TRX_AMT           AS "trxAmt",
+               TRX_CCY_CD        AS "trxCcyCd",
+               REM_ACCT_NO       AS "remAcctNo",
+               BEN_ACCT_NO       AS "benAcctNo",
+               BEN_ACCT_NM       AS "benAcctNm",
+               REMARK1           AS "remark1",
+               MAKER_USER_NAME   AS "makerUserName",
+               CREATED_DT        AS "createdDt",
+               VERSION           AS "version",
+               CORE_JOURNAL      AS "coreJournal",
+               TRX_REF_NO        AS "trxRefNo",
+               EXECUTED_DT       AS "executedDt"
+        FROM TRX_TASK
+        WHERE CORP_ID = #{companyId}
+          AND ID = #{taskId}
+    </select>
+
+    <select id="findStages" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$StageRow">
+        SELECT SEQ_NO          AS "seqNo",
+               STAGE_TYPE      AS "stageType",
+               APRV_LVL_CD     AS "aprvLvlCd",
+               USR_GRP_OPT     AS "usrGrpOpt",
+               REQUIRED_COUNT  AS "requiredCount",
+               COMPLETED_COUNT AS "completedCount",
+               STATUS          AS "status"
+        FROM TRX_TASK_STAGE
+        WHERE TRX_TASK_ID = #{taskId}
+        ORDER BY SEQ_NO
+    </select>
+
+    <select id="findActions" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$ActionRow">
+        SELECT STAGE_SEQ       AS "stageSeq",
+               ACTION          AS "action",
+               ACTOR_USER_NAME AS "actorUserName",
+               NOTE            AS "note",
+               CREATED_DT      AS "createdDt"
+        FROM TRX_TASK_ACTION
+        WHERE TRX_TASK_ID = #{taskId}
+        ORDER BY CREATED_DT, ID
+    </select>
+
+    <select id="findCandidate" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$CandidateRow">
+        SELECT CORP_USR_ID     AS "corpUsrId",
+               USER_NAME       AS "userName",
+               CORP_USR_GRP_ID AS "corpUsrGrpId"
+        FROM TRX_TASK_CANDIDATE
+        WHERE TRX_TASK_ID = #{taskId}
+          AND STAGE_SEQ = #{stageSeq}
+          AND USER_ID = #{userId}
+    </select>
+
+    <select id="countStageActions" resultType="int">
+        SELECT COUNT(*)
+        FROM TRX_TASK_ACTION
+        WHERE TRX_TASK_ID = #{taskId}
+          AND STAGE_SEQ = #{stageSeq}
+          AND ACTOR_USER_ID = #{actorUserId}
+    </select>
+
+    <!--
+      The inbox. Entered by login id through the frozen candidate set: the join to
+      TRX_TASK_CANDIDATE is what makes a later-onboarded user blind to older tasks.
+      The NOT EXISTS keeps a task visible to the OTHER candidates of a 2-of-N stage
+      after the first of them approved (actions store CORP_USR.ID, candidates carry it
+      alongside the login id precisely for this correlation).
+    -->
+    <select id="findInbox" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$InboxRow">
+        SELECT t.ID              AS "id",
+               t.REF_NO          AS "refNo",
+               t.MENU_CD         AS "menuCd",
+               t.STATUS          AS "status",
+               t.TRX_AMT         AS "trxAmt",
+               t.TRX_CCY_CD      AS "trxCcyCd",
+               t.REM_ACCT_NO     AS "remAcctNo",
+               t.BEN_ACCT_NO     AS "benAcctNo",
+               t.BEN_ACCT_NM     AS "benAcctNm",
+               t.REMARK1         AS "remark1",
+               t.MAKER_USER_NAME AS "makerUserName",
+               t.CREATED_DT      AS "createdDt",
+               s.SEQ_NO          AS "stageSeq",
+               s.STAGE_TYPE      AS "stageType",
+               s.REQUIRED_COUNT  AS "requiredCount",
+               s.COMPLETED_COUNT AS "completedCount"
+        FROM TRX_TASK t
+        JOIN TRX_TASK_STAGE s
+          ON s.TRX_TASK_ID = t.ID
+         AND s.SEQ_NO = t.CURRENT_STAGE_SEQ
+         AND s.STATUS = N'ACTIVE'
+        JOIN TRX_TASK_CANDIDATE c
+          ON c.TRX_TASK_ID = t.ID
+         AND c.STAGE_SEQ = s.SEQ_NO
+         AND c.USER_ID = #{userId}
+        WHERE t.CORP_ID = #{companyId}
+          AND t.STATUS IN (N'PENDING_APPROVAL', N'PENDING_RELEASE')
+          AND NOT EXISTS (SELECT 1
+                          FROM TRX_TASK_ACTION a
+                          WHERE a.TRX_TASK_ID = t.ID
+                            AND a.STAGE_SEQ = s.SEQ_NO
+                            AND a.ACTOR_USER_ID = c.CORP_USR_ID)
+        ORDER BY t.CREATED_DT DESC, t.ID
+    </select>
+
+    <!-- The optimistic claim: 0 rows back means someone else's approve/reject landed
+         between this caller's read and their write - answered as a 422, never a double
+         count. Every state change of a task goes through here, so a matching VERSION
+         also certifies the stage rows read alongside it were current. -->
+    <update id="updateTaskProgress">
+        UPDATE TRX_TASK
+        SET STATUS = #{status},
+            CURRENT_STAGE_SEQ = #{currentStageSeq},
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+          AND VERSION = #{expectedVersion}
+    </update>
+
+    <update id="updateStageProgress">
+        UPDATE TRX_TASK_STAGE
+        SET COMPLETED_COUNT = #{completedCount},
+            STATUS = #{status},
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE TRX_TASK_ID = #{taskId}
+          AND SEQ_NO = #{seqNo}
+    </update>
+
+    <update id="updateStageStatus">
+        UPDATE TRX_TASK_STAGE
+        SET STATUS = #{status},
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE TRX_TASK_ID = #{taskId}
+          AND SEQ_NO = #{seqNo}
+    </update>
+
+    <!-- The execution phase's read: by ID alone, carrying what the core call and the
+         BASE_FT write need. Company scope was proven when the task was released. -->
+    <select id="findTaskForExecution" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$ExecutionTaskRow">
+        SELECT ID            AS "id",
+               CORP_ID       AS "corpId",
+               MENU_CD       AS "menuCd",
+               SRVC_CD       AS "srvcCd",
+               REF_NO        AS "refNo",
+               STATUS        AS "status",
+               REM_ACCT_NO   AS "remAcctNo",
+               BEN_ACCT_NO   AS "benAcctNo",
+               BEN_ACCT_NM   AS "benAcctNm",
+               TRX_AMT       AS "trxAmt",
+               TRX_CCY_CD    AS "trxCcyCd",
+               REMARK1       AS "remark1",
+               MAKER_USER_ID AS "makerUserId",
+               VERSION       AS "version"
+        FROM TRX_TASK
+        WHERE ID = #{taskId}
+    </select>
+
+    <!-- The EXECUTING claim: the same optimistic VERSION discipline as updateTaskProgress,
+         additionally pinned to the two claimable statuses. 0 rows = someone else already claimed
+         (or finished) this task - the double-execute guard. -->
+    <update id="claimExecution">
+        UPDATE TRX_TASK
+        SET STATUS = N'EXECUTING',
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+          AND VERSION = #{expectedVersion}
+          <!-- QUEUED is kafka mode's READY_TO_EXECUTE (V4): the workflow completed and
+               the event pipeline owns execution. Both claim identically. -->
+          AND STATUS IN (N'READY_TO_EXECUTE', N'QUEUED')
+    </update>
+
+    <!-- Both verdict updates are pinned to EXECUTING: only the claim holder may land a
+         verdict, and landing it twice is impossible. -->
+    <update id="markExecuted">
+        UPDATE TRX_TASK
+        SET STATUS = N'EXECUTED',
+            CORE_JOURNAL = #{coreJournal},
+            TRX_REF_NO = #{trxRefNo},
+            EXECUTED_DT = SYSDATE,
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+          AND STATUS = N'EXECUTING'
+    </update>
+
+    <update id="markExecutionOutcome">
+        UPDATE TRX_TASK
+        SET STATUS = #{status},
+            EXECUTED_DT = SYSDATE,
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+          AND STATUS = N'EXECUTING'
+    </update>
+
+    <!-- The latest RELEASE actor (CORP_USR.ID); null on the single-user path. -->
+    <select id="findReleaseActorId" resultType="string">
+        SELECT ACTOR_USER_ID
+        FROM TRX_TASK_ACTION
+        WHERE TRX_TASK_ID = #{taskId}
+          AND ACTION = N'RELEASE'
+        ORDER BY CREATED_DT DESC, ID DESC
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <!-- CLOSED, not DONE: a stage terminated by a reject was never completed. -->
+    <update id="closeOpenStages">
+        UPDATE TRX_TASK_STAGE
+        SET STATUS = N'CLOSED',
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE TRX_TASK_ID = #{taskId}
+          AND STATUS IN (N'WAITING', N'ACTIVE')
+    </update>
+
+</mapper>

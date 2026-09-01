@@ -1,0 +1,241 @@
+# direct-transaction - base configuration.
+#
+# Every credential and every per-environment value reads from an environment variable, so
+# OCP secrets supply the real ones and nothing sensitive is committed. Defaults here are
+# local-development values only.
+server:
+  port: ${SERVER_PORT:5244}
+  forward-headers-strategy: framework   # X-Forwarded-* handling behind the OCP route
+  shutdown: graceful
+
+spring:
+  application:
+    name: direct-transaction
+
+  datasource:
+    url: ${ORACLE_URL:jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=FREE)))}
+    username: ${ORACLE_USER:DIRECT}
+    password: ${ORACLE_PASSWORD:}
+    driver-class-name: oracle.jdbc.OracleDriver
+    hikari:
+      # Every pool number is an environment override: a laptop and an OCP pod running 50
+      # connections each against the same Oracle are very different load.
+      minimum-idle: ${DB_POOL_MIN_IDLE:0}
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:50}
+      # How long a caller waits for a free connection before failing fast. Raising this
+      # hides pool exhaustion as latency instead of surfacing it as an error.
+      connection-timeout: ${DB_POOL_CONNECTION_TIMEOUT_MS:30000}
+      validation-timeout: ${DB_POOL_VALIDATION_TIMEOUT_MS:5000}
+      idle-timeout: ${DB_POOL_IDLE_TIMEOUT_MS:600000}
+      # Must stay below any firewall or Oracle profile idle limit, or the pool hands out
+      # connections the network has already dropped.
+      max-lifetime: ${DB_POOL_MAX_LIFETIME_MS:1800000}
+      connection-test-query: SELECT 1 FROM DUAL
+
+  flyway:
+    enabled: ${FLYWAY_ENABLED:true}
+    locations: classpath:db/migration
+    # This service runs against the shared, pre-existing DIRECT schema (CORP_USR,
+    # CORP_ACCT, CORP_APRV_MTRX_*, TRX_REF_NO_SEQUENCE, ...). Flyway does not own those
+    # tables and must NEVER try to create them: migrations here may only touch objects this
+    # service itself introduced (TRX_TASK, TRX_TASK_STAGE, TRX_TASK_ACTION).
+    #
+    # baseline-on-migrate with baseline-version 0, NOT 1 like direct-account: that
+    # service's V1 was a template worked example it wanted skipped on the legacy schema,
+    # whereas this service's V1 creates its OWN new tables and must run everywhere -
+    # including on the already-populated DIRECT schema. Version 0 stamps the pre-existing
+    # schema below every real migration, so V1 applies on first boot.
+    baseline-on-migrate: true
+    baseline-version: 0
+    baseline-description: Pre-existing DIRECT schema
+    # A checksum mismatch means a committed migration was edited after it ran somewhere.
+    # Failing at boot is the point: the alternative is environments quietly diverging.
+    validate-on-migrate: true
+    out-of-order: false
+    # No url/user/password here: Flyway falls back to spring.datasource, which is right
+    # wherever one Oracle user both owns and uses the schema. Where the owner and the
+    # runtime user are split, OCP supplies SPRING_FLYWAY_URL / SPRING_FLYWAY_USER /
+    # SPRING_FLYWAY_PASSWORD so the pool keeps its DML-only grants.
+    schemas: ${FLYWAY_SCHEMA:${ORACLE_USER:DIRECT}}
+    default-schema: ${FLYWAY_SCHEMA:${ORACLE_USER:DIRECT}}
+    # NOT Flyway's default name, for the same reason as direct-admin: DIRECT is shared.
+    # direct-integration keeps its history in "flyway_schema_history", direct-bankmodule
+    # in "flyway_schema_history_bankmodule", direct-admin in "flyway_schema_history_admin",
+    # direct-account in "flyway_schema_history_account". Two services writing one history
+    # table would each see the other's migrations as unresolved and refuse to start.
+    table: ${FLYWAY_TABLE:flyway_schema_history_transaction}
+
+  jackson:
+    default-property-inclusion: always
+    serialization:
+      write-dates-as-timestamps: false
+    deserialization:
+      fail-on-unknown-properties: false
+
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+  kafka:
+    # Only used when app.execution.mode=kafka; in sync mode nothing here ever connects.
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # The broker must confirm the full ISR before the relay marks a row SENT - an
+      # outbox that trusts a single-replica ack loses events on broker failover.
+      acks: all
+      properties:
+        # Broker-side dedup of producer retries: a retried send never writes twice.
+        enable.idempotence: true
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # A fresh group starts at the oldest event: an execution request queued before the
+      # first consumer came up must still execute.
+      auto-offset-reset: earliest
+      # Modest batches: each record is one core-banking execution, seconds not millis.
+      # Keeping the batch small keeps one poll comfortably inside max.poll.interval.
+      max-poll-records: 10
+      properties:
+        # 10 executions x a slow core call still fits well within 5 minutes; blowing this
+        # budget gets the consumer kicked from the group mid-batch.
+        max.poll.interval.ms: 300000
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    # ACCOUNT_NO -> accountNo, so no column aliases are needed in the SQL.
+    map-underscore-to-camel-case: true
+    # Lets row types be Java records: MyBatis matches SELECT columns to canonical-constructor
+    # parameter names. Requires -parameters, set in pom.xml.
+    arg-name-based-constructor-auto-mapping: true
+    jdbc-type-for-null: 'NULL'
+    default-statement-timeout: 60
+
+app:
+  cors:
+    # Host-only matching - entries carry no scheme and no port, see
+    # HostMatchingCorsConfigurationSource. Comma-separated in the environment variable,
+    # bound as a list.
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:localhost}
+    exposed-headers: ${CORS_EXPOSED_HEADERS:X-Correlation-Id}
+
+  correlation:
+    header-name: X-Correlation-Id
+    service-name: direct-transaction
+    excluded-paths:
+      - /actuator
+      - /swagger-ui
+      - /v3/api-docs
+
+  errors:
+    # Raw exception text in responses. Overridden to false in application-prod.yml.
+    expose-detail: ${ERRORS_EXPOSE_DETAIL:false}
+
+  execution:
+    # How a completed workflow gets executed. sync (default): in the releasing request,
+    # the HTTP answer carries the verdict - no broker needed, dev behaves exactly as
+    # before. kafka: the workflow transaction lands the task QUEUED plus an outbox row
+    # (TRX_EVENT_OUTBOX, V4), the relay publishes it, the listener executes it; the
+    # release/submit answer is then QUEUED and the verdict arrives on the task.
+    mode: ${EXECUTION_MODE:sync}
+    # The relay's drain interval and batch size.
+    outbox-poll-ms: ${EXECUTION_OUTBOX_POLL_MS:1000}
+    outbox-batch: ${EXECUTION_OUTBOX_BATCH:100}
+    # Sends-per-row before the row flips FAILED and stops retrying (logged at ERROR -
+    # alert on it; the task sits QUEUED until the row is re-queued by hand).
+    outbox-max-attempts: ${EXECUTION_OUTBOX_MAX_ATTEMPTS:10}
+    # How long one synchronous send may take before it counts as a failed attempt.
+    send-timeout-ms: ${EXECUTION_SEND_TIMEOUT_MS:10000}
+    # Key = taskId on both topics, so one task's events stay ordered per partition.
+    # Listener infrastructure failures dead-letter to '<topic-requested>.DLT'.
+    topic-requested: ${EXECUTION_TOPIC_REQUESTED:direct.transfer.execution.requested}
+    topic-completed: ${EXECUTION_TOPIC_COMPLETED:direct.transfer.execution.completed}
+    group: ${EXECUTION_GROUP:direct-transaction-executor}
+    # Parallel listener threads; the VERSION-guarded claim makes concurrency safe.
+    concurrency: ${EXECUTION_CONCURRENCY:3}
+
+  integration:
+    # Beneficiary name inquiry via direct-integration's internal core-account endpoint.
+    # Unlike direct-account's balance decoration this hop is load-bearing - the inquiry
+    # endpoint answers 503 rather than a fabricated name when it is off or down.
+    enabled: ${INTEGRATION_ENABLED:false}
+    base-url: ${INTEGRATION_BASE_URL:http://localhost:5243}
+    api-key: ${INTEGRATION_API_KEY:}
+
+  umas:
+    auth:
+      # Validate the Bearer JWT the UMAS gateway forwards, replace X-User-Id with the
+      # token's identity, and bind the caller to the path {companyId} and any userId
+      # query/body field (IdentityBindingInterceptor + TokenIdentity). Off by default so
+      # local development without the UMAS stack keeps working - the endpoints are then
+      # OPEN and the service must not be reachable from outside the cluster.
+      # Same keys and env names as direct-admin's app.umas.auth block.
+      enabled: ${UMAS_AUTH_ENABLED:false}
+      # UMAS JWT signing public key, base64 X.509 DER - same value the auth-service
+      # gets as BNI_DIRECT_JWK_PUBLIC_KEY. Required when enabled.
+      jwk-public-key: ${UMAS_JWK_PUBLIC_KEY:}
+      # POSTLOGIN: this service serves corporate makers/approvers/releasers, and that is
+      # the scope their tokens carry. BANK_STAFF is a bank employee's scope.
+      required-scope: ${UMAS_REQUIRED_SCOPE:POSTLOGIN}
+      # Ask token-service whether the jti is still live (logout/revocation), the same
+      # check the gateway performs. Fail-closed.
+      presence-check-enabled: ${UMAS_PRESENCE_CHECK_ENABLED:false}
+      token-base-url: ${UMAS_TOKEN_BASE_URL:http://localhost:8083}
+      # Sent on the direct token-service call; must match UMAS bni.direct.api-security.
+      mav-api-key: ${UMAS_MAV_API_KEY:sim-api-key-local}
+    authorization:
+      # RBAC enforcement of @RequiresPermission (transfer-bni on /transfers*, task-pending
+      # on /tasks*). Off by default: nothing is registered and the service behaves exactly
+      # as today. This flag is the ONLY sanctioned way to turn enforcement off
+      # (RBAC_TENANT_INTEGRATION.md §7) - a failure to reach UMAS is a deny, never a pass.
+      # Turning it on requires app.umas.auth.enabled=true; the service refuses to start
+      # otherwise - see UmasEnforcementStartupCheck.
+      enabled: ${UMAS_AUTHORIZATION_ENABLED:false}
+      # auth-service directly, NOT the gateway: only this service knows which
+      # resource:action a request needs, and the client carries Mav-API-Key / Request-Id /
+      # X-Tenant-Id itself. Same env names as direct-admin, so one value routes both.
+      base-url: ${UMAS_AUTHORIZATION_BASE_URL:http://localhost:8081}
+      mav-api-key: ${UMAS_MAV_API_KEY:sim-api-key-local}
+      # Must match the tenant the corporate RBAC catalog is seeded under (V13/V20).
+      tenant-id: ${UMAS_TENANT_ID:bni-direct}
+      # Explicit, and both are a DENY when exceeded.
+      connect-timeout: ${UMAS_AUTHORIZATION_CONNECT_TIMEOUT:2s}
+      read-timeout: ${UMAS_AUTHORIZATION_READ_TIMEOUT:3s}
+
+  authenticator:
+    # UMAS authenticator - OTP challenge and transaction verification.
+    base-url: ${AUTHENTICATOR_BASE_URL:http://localhost:8085}
+    tenant-id: ${AUTHENTICATOR_TENANT_ID:default}
+    # Identifies this system on the internal hop, same header as direct-admin's UMAS
+    # clients send. Empty means the header is not sent (a local UMAS without api-security).
+    mav-api-key: ${AUTHENTICATOR_MAV_API_KEY:}
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # health and info only. /env and /heapdump leak credentials and memory contents,
+        # so widening this list means putting the management port behind something first.
+        include: health,info
+  metrics:
+    distribution:
+      # Client-side percentiles, not percentiles-histogram: a histogram would publish a
+      # bucket series per mapper statement. These two series per statement show which query
+      # degraded, at the cost of not being aggregatable across pods.
+      percentiles:
+        mybatis.statement: 0.95,0.99
+        http.server.requests: 0.95,0.99
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: INFO
+    id.co.bni: INFO

@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  TRX_EVENT_OUTBOX (V4) - the transactional outbox of kafka-mode execution. Same
+  conventions as TrxTaskMapper.xml: NVARCHAR2 columns, N'...' status literals, ids minted
+  in Java, timestamps from SYSDATE.
+-->
+<mapper namespace="id.co.bni.direct.transaction.repository.mapper.ExecutionOutboxMapper">
+
+    <insert id="insert">
+        INSERT INTO TRX_EVENT_OUTBOX (ID, EVENT_TYPE, AGGREGATE_ID, PAYLOAD, STATUS,
+                                      ATTEMPTS, CREATED_DT)
+        VALUES (#{id}, #{eventType}, #{aggregateId}, #{payload}, N'NEW', 0, SYSDATE)
+    </insert>
+
+    <!-- The drain read. ROWNUM in a subquery rather than FETCH FIRST because Oracle
+         refuses FOR UPDATE over a row-limiting clause (the same reason as
+         TransferMapper's lockRefNoValue); the inner query picks the oldest NEW ids, the
+         outer locks those rows. SKIP LOCKED makes a second relay instance skip rows the
+         first one is already sending instead of blocking behind it. -->
+    <select id="lockNewBatch" resultType="id.co.bni.direct.transaction.entity.EventOutboxRows$PendingEventRow">
+        SELECT o.ID           AS "id",
+               o.EVENT_TYPE   AS "eventType",
+               o.AGGREGATE_ID AS "aggregateId",
+               o.PAYLOAD      AS "payload",
+               o.ATTEMPTS     AS "attempts"
+        FROM TRX_EVENT_OUTBOX o
+        WHERE o.ID IN (
+            SELECT ID
+            FROM (SELECT ID
+                  FROM TRX_EVENT_OUTBOX
+                  WHERE STATUS = N'NEW'
+                  ORDER BY CREATED_DT)
+            WHERE ROWNUM &lt;= #{limit})
+        ORDER BY o.CREATED_DT
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <update id="markSent">
+        UPDATE TRX_EVENT_OUTBOX
+        SET STATUS = N'SENT',
+            ATTEMPTS = ATTEMPTS + 1,
+            LAST_ERROR = NULL,
+            SENT_DT = SYSDATE
+        WHERE ID = #{id}
+    </update>
+
+    <update id="markSendFailure">
+        UPDATE TRX_EVENT_OUTBOX
+        SET ATTEMPTS = ATTEMPTS + 1,
+            LAST_ERROR = #{error}
+        WHERE ID = #{id}
+    </update>
+
+    <update id="markFailed">
+        UPDATE TRX_EVENT_OUTBOX
+        SET STATUS = N'FAILED',
+            ATTEMPTS = ATTEMPTS + 1,
+            LAST_ERROR = #{error}
+        WHERE ID = #{id}
+    </update>
+</mapper>

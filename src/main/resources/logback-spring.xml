@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Two channels, matching spine-backoffice so one log collector configuration serves both:
+    * InboundLogger -> one line per request, in the [LEVEL] : {#...#} envelope existing
+      scrapers already match.
+    * root -> application logs, with the correlation id from the MDC on every line.
+
+  Log shipping is the OCP collector's job; there is no Kafka appender here.
+-->
+<configuration>
+
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="direct-transaction"/>
+    <property name="LOG_PATH" value="${LOG_PATH:-logs}"/>
+
+    <appender name="APP_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS}|%-5level|%logger{40}|[%X{correlationId:--}] %msg%n%ex</pattern>
+        </encoder>
+    </appender>
+
+    <appender name="APP_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH}/system/syslog.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_PATH}/system/syslog-%d{yyyy-MM-dd}.log</fileNamePattern>
+            <maxHistory>30</maxHistory>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS}|%-5level|%logger{40}|[%X{correlationId:--}] %msg%n%ex</pattern>
+        </encoder>
+    </appender>
+
+    <!--
+      The message is already the complete pipe-separated line built by CorrelationFilter.
+      Nothing may be inserted between the |@| separators - downstream parsers split on them.
+    -->
+    <appender name="INBOUND_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>[%level] : {#%d{yyyy-MM-dd HH:mm:ss.SSSS}|@|%msg#}%n</pattern>
+        </encoder>
+    </appender>
+
+    <appender name="INBOUND_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH}/http/http.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_PATH}/http/http-%d{yyyy-MM-dd}.log</fileNamePattern>
+            <maxHistory>30</maxHistory>
+        </rollingPolicy>
+        <encoder>
+            <pattern>[%level] : {#%d{yyyy-MM-dd HH:mm:ss.SSSS}|@|%msg#}%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="InboundLogger" level="INFO" additivity="false">
+        <appender-ref ref="INBOUND_CONSOLE"/>
+        <appender-ref ref="INBOUND_FILE"/>
+    </logger>
+
+    <root level="INFO">
+        <appender-ref ref="APP_CONSOLE"/>
+        <appender-ref ref="APP_FILE"/>
+    </root>
+
+</configuration>

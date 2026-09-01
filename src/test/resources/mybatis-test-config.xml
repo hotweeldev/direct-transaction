@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE configuration PUBLIC "-//mybatis.org//DTD Config 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-config.dtd">
+
+<!--
+    Loads the mappers without a datasource so the statements can be parsed and checked
+    offline. The settings mirror what application.yml gives the real SqlSessionFactory - in
+    particular arg-name-based constructor auto-mapping, without which every record result
+    type would bind its columns positionally and silently mis-map.
+
+    Add every new mapper XML here, or MapperStatementsTest will not see it.
+-->
+<configuration>
+    <settings>
+        <setting name="mapUnderscoreToCamelCase" value="true"/>
+        <setting name="argNameBasedConstructorAutoMapping" value="true"/>
+        <setting name="jdbcTypeForNull" value="NULL"/>
+    </settings>
+
+    <environments default="test">
+        <environment id="test">
+            <transactionManager type="JDBC"/>
+            <dataSource type="UNPOOLED">
+                <!-- Never connected to; MyBatis only needs an environment to build a factory. -->
+                <property name="driver" value="org.h2.Driver"/>
+                <property name="url" value="jdbc:h2:mem:unused"/>
+            </dataSource>
+        </environment>
+    </environments>
+
+    <mappers>
+        <mapper resource="mapper/TransferMapper.xml"/>
+        <mapper resource="mapper/TrxTaskMapper.xml"/>
+        <mapper resource="mapper/ExecutionOutboxMapper.xml"/>
+    </mappers>
+</configuration>
