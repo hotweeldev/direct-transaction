@@ -3,6 +3,7 @@ package id.co.bni.direct.transaction.service;
 import java.math.BigDecimal;
 import java.util.List;
 
+import id.co.bni.direct.transaction.entity.TransferRows.BankLimitRow;
 import id.co.bni.direct.transaction.entity.TransferRows.BaseFtInsert;
 import id.co.bni.direct.transaction.entity.TransferRows.UsageLockRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ActionInsert;
@@ -137,6 +138,58 @@ class CoreExecutionServiceImplTest {
         verify(transferMapper, never()).insertBaseFt(any());
         verify(trxTaskMapper).markExecutionOutcome(TASK, "FAILED", "CU9");
         verify(txManager, never()).rollback(any());
+    }
+
+    // ---- Decision A: the bank's per-transaction ceilings are re-read at release ----
+
+    @Test
+    void aBankLimitLoweredWhileTheTaskWaitedFailsAtReleaseWithoutIncrementing() {
+        stubClaimable();
+        // The bank cut the per-transaction max below this task's 10.000.000 on day two.
+        when(transferMapper.findBankLimit("GCM_FTR_IH_3RD", "IDR"))
+                .thenReturn(new BankLimitRow(BigDecimal.ZERO, new BigDecimal("5000000")));
+
+        var result = service.execute(TASK);
+
+        assertThat(result.status()).isEqualTo("FAILED");
+        assertThat(result.message()).contains("Limit transaksi bank berubah");
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
+        verify(coreTransferClient, never()).transfer(anyString(), anyString(), any(), anyString(), any());
+        verify(trxTaskMapper).markExecutionOutcome(TASK, "FAILED", "CU9");
+    }
+
+    @Test
+    void anAccountDebitLimitLoweredWhileTheTaskWaitedFailsAtRelease() {
+        stubClaimable();
+        when(transferMapper.findBankLimit("GCM_FTR_IH_3RD", "IDR"))
+                .thenReturn(new BankLimitRow(BigDecimal.ZERO, new BigDecimal("999999999999")));
+        when(transferMapper.findAccountDebitLimit("CORP1", "113179933"))
+                .thenReturn(new BigDecimal("9999999"));
+
+        var result = service.execute(TASK);
+
+        assertThat(result.status()).isEqualTo("FAILED");
+        assertThat(result.message()).contains("Limit debit rekening sumber berubah");
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(coreTransferClient, never()).transfer(anyString(), anyString(), any(), anyString(), any());
+    }
+
+    @Test
+    void bankAndAccountLimitsStillSatisfiedAtReleaseLetTheTransferProceed() {
+        stubClaimable();
+        when(transferMapper.findBankLimit("GCM_FTR_IH_3RD", "IDR"))
+                .thenReturn(new BankLimitRow(BigDecimal.ZERO, new BigDecimal("999999999999")));
+        when(transferMapper.findAccountDebitLimit("CORP1", "113179933"))
+                .thenReturn(new BigDecimal("1000000000000"));
+        when(coreTransferClient.transfer(anyString(), anyString(), any(), anyString(), any()))
+                .thenReturn(new TransferOutcome(Status.REFUSED, null, "stop here"));
+
+        service.execute(TASK);
+
+        // Both checks passed: the usage increment ran, i.e. we reached the core call.
+        verify(transferMapper).incrementCorpLimitUsage("CL1", AMOUNT);
+        verify(coreTransferClient).transfer(anyString(), anyString(), any(), anyString(), any());
     }
 
     // ---- Core refusal ----

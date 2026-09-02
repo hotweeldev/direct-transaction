@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  Aktivitas Transaksi - the corporate user's transaction activity (home card + submenu).
+
+  Two sources, one row shape:
+    TASK   - TRX_TASK, every status. The only place a DIPROSES / GAGAL transaction exists:
+             legacy never wrote a pending or refused transaction to BASE_FT.
+    LEGACY - BASE_FT, the legacy final record. Rows the rewrite executed are ALSO in BASE_FT,
+             so they are excluded here by REF_NO and served from TRX_TASK, which carries the
+             approval trail.
+
+  Scope (decision 2026-09-01): per company, and only accounts the user holds INQUIRY rights
+  on through the legacy chain CORP_USR -> CORP_USR_GRP -> CORP_ACCT_GRP_DTL (IS_INQ) ->
+  CORP_ACCT. A user outside any account group (a pure corporate admin) sees nothing.
+
+  BASE_FT has no CORP_ID; company membership is REM_ACCT_NO in the company's CORP_ACCT.
+  NVARCHAR2 and VARCHAR2 columns cannot meet in a UNION (ORA-12704), hence TO_NCHAR on the
+  legacy VARCHAR2 columns.
+-->
+<mapper namespace="id.co.bni.direct.transaction.repository.mapper.ActivityMapper">
+
+    <!-- Accounts this user may inquire: the same chain direct-account walks. -->
+    <sql id="inquiryAccounts">
+        SELECT ca.ACCT_NO
+        FROM CORP_USR u
+        JOIN CORP_USR_GRP g      ON g.ID = u.CORP_USR_GRP_ID AND g.CORP_ID = #{f.companyId} AND g.IS_DELETE = N'N'
+        JOIN CORP_ACCT_GRP ag    ON ag.ID = g.CORP_ACCT_GRP_ID AND ag.IS_DELETE = N'N'
+        JOIN CORP_ACCT_GRP_DTL d ON d.CORP_ACCT_GRP_ID = ag.ID AND d.IS_INQ = N'Y'
+        JOIN CORP_ACCT ca        ON ca.ID = d.CORP_ACCT_NO
+        WHERE u.USER_ID = #{f.userId}
+    </sql>
+
+    <!-- The union. Unquoted uppercase aliases here; the outer select maps them to record names. -->
+    <sql id="activityUnion">
+        SELECT N'TASK'                       AS SOURCE_CD,
+               t.ID                          AS TASK_ID,
+               t.REF_NO                      AS REF_NO,
+               t.TRX_REF_NO                  AS TRX_REF_NO,
+               t.MENU_CD                     AS MENU_CD,
+               t.SRVC_CD                     AS SRVC_CD,
+               t.STATUS                      AS RAW_STATUS,
+               CASE t.STATUS
+                    WHEN N'EXECUTED' THEN N'BERHASIL'
+                    WHEN N'FAILED'   THEN N'GAGAL'
+                    WHEN N'REJECTED' THEN N'GAGAL'
+                    ELSE N'DIPROSES'
+               END                           AS STATUS_GROUP,
+               t.TRX_AMT                     AS TRX_AMT,
+               t.TRX_CCY_CD                  AS TRX_CCY_CD,
+               t.REM_ACCT_NO                 AS REM_ACCT_NO,
+               t.BEN_ACCT_NO                 AS BEN_ACCT_NO,
+               t.BEN_ACCT_NM                 AS BEN_ACCT_NM,
+               t.REMARK1                     AS REMARK1,
+               t.INSTRUCTION_MODE            AS INSTRUCTION_MODE,
+               t.INSTRUCTION_DT              AS INSTRUCTION_DT,
+               t.CREATED_DT                  AS CREATED_DT,
+               t.EXECUTED_DT                 AS EXECUTED_DT,
+               t.CORE_JOURNAL                AS JOURNAL_NO,
+               t.MAKER_USER_NAME             AS MAKER_USER_NAME,
+               CAST(NULL AS NVARCHAR2(40))   AS ORDER_PARTY_REF_NO,
+               CAST(NULL AS NVARCHAR2(40))   AS COUNTER_PARTY_REF_NO
+        FROM TRX_TASK t
+        WHERE t.CORP_ID = #{f.companyId}
+        UNION ALL
+        SELECT N'LEGACY',
+               CAST(NULL AS NVARCHAR2(40)),
+               f.REF_NO,
+               f.TRX_REF_NO,
+               f.MNU_CD,
+               f.SRVC_CD,
+               CASE WHEN f.IS_PROCESSED = N'Y' THEN N'EXECUTED' ELSE N'PENDING' END,
+               CASE WHEN f.IS_PROCESSED = N'Y' THEN N'BERHASIL' ELSE N'DIPROSES' END,
+               f.TRX_AMT,
+               f.TRX_CCY_CD,
+               f.REM_ACCT_NO,
+               f.BEN_ACCT_NO,
+               f.BEN_ACCT_NM,
+               f.REMARK1,
+               f.INSTRUCTION_MODE,
+               f.INSTRUCTION_DT,
+               f.CREATED_DT,
+               CASE WHEN f.IS_PROCESSED = N'Y' THEN f.CREATED_DT END,
+               TO_NCHAR(f.JOURNAL_NO),
+               mk.USER_ID,
+               f.ORDER_PARTY_REF_NO,
+               f.COUNTER_PARTY_REF_NO
+        FROM BASE_FT f
+        LEFT JOIN CORP_USR mk ON mk.ID = f.CREATED_BY
+        WHERE f.REM_ACCT_NO IN (SELECT ca2.ACCT_NO FROM CORP_ACCT ca2 WHERE ca2.CORP_ID = #{f.companyId})
+          AND NOT EXISTS (SELECT 1 FROM TRX_TASK x WHERE x.CORP_ID = #{f.companyId} AND x.REF_NO = f.REF_NO)
+    </sql>
+
+    <sql id="activityWhere">
+        WHERE r.REM_ACCT_NO IN (<include refid="inquiryAccounts"/>)
+        <if test="f.dateFrom != null">
+            AND r.CREATED_DT &gt;= #{f.dateFrom}
+        </if>
+        <if test="f.dateTo != null">
+            AND r.CREATED_DT &lt; #{f.dateTo} + 1
+        </if>
+        <if test="f.menuCd != null">
+            AND r.MENU_CD = #{f.menuCd}
+        </if>
+        <if test="f.statusGroup != null">
+            AND r.STATUS_GROUP = #{f.statusGroup}
+        </if>
+        <if test="f.sourceAccountNo != null">
+            AND r.REM_ACCT_NO = #{f.sourceAccountNo}
+        </if>
+        <if test="f.beneficiaryName != null">
+            AND UPPER(r.BEN_ACCT_NM) LIKE '%' || UPPER(#{f.beneficiaryName}) || '%'
+        </if>
+        <if test="f.amountFrom != null">
+            AND r.TRX_AMT &gt;= #{f.amountFrom}
+        </if>
+        <if test="f.amountTo != null">
+            AND r.TRX_AMT &lt;= #{f.amountTo}
+        </if>
+        <if test="f.refNo != null">
+            AND r.REF_NO = #{f.refNo}
+        </if>
+    </sql>
+
+    <sql id="activityColumns">
+        SELECT r.SOURCE_CD            AS "source",
+               r.TASK_ID              AS "taskId",
+               r.REF_NO               AS "refNo",
+               r.TRX_REF_NO           AS "trxRefNo",
+               r.MENU_CD              AS "menuCd",
+               r.SRVC_CD              AS "srvcCd",
+               s.NM                   AS "srvcNm",
+               r.RAW_STATUS           AS "rawStatus",
+               r.STATUS_GROUP         AS "statusGroup",
+               r.TRX_AMT              AS "trxAmt",
+               r.TRX_CCY_CD           AS "trxCcyCd",
+               r.REM_ACCT_NO          AS "remAcctNo",
+               a.ACCT_NM              AS "remAcctNm",
+               a.CCY_CD               AS "remAcctCcy",
+               r.BEN_ACCT_NO          AS "benAcctNo",
+               r.BEN_ACCT_NM          AS "benAcctNm",
+               r.REMARK1              AS "remark1",
+               r.INSTRUCTION_MODE     AS "instructionMode",
+               r.INSTRUCTION_DT       AS "instructionDt",
+               r.CREATED_DT           AS "createdDt",
+               r.EXECUTED_DT          AS "executedDt",
+               r.JOURNAL_NO           AS "journalNo",
+               r.MAKER_USER_NAME      AS "makerUserName",
+               r.ORDER_PARTY_REF_NO   AS "orderPartyRefNo",
+               r.COUNTER_PARTY_REF_NO AS "counterPartyRefNo"
+        FROM (<include refid="activityUnion"/>) r
+        LEFT JOIN ACCT a        ON a.ACCT_NO = r.REM_ACCT_NO
+        LEFT JOIN COM_ST_SRVC s ON s.CD = r.SRVC_CD
+    </sql>
+
+    <select id="search" resultType="id.co.bni.direct.transaction.entity.ActivityRows$ActivityRow">
+        <include refid="activityColumns"/>
+        <include refid="activityWhere"/>
+        ORDER BY r.CREATED_DT DESC, r.REF_NO DESC
+        OFFSET #{f.offset} ROWS FETCH NEXT #{f.size} ROWS ONLY
+    </select>
+
+    <select id="count" resultType="long">
+        SELECT COUNT(*)
+        FROM (<include refid="activityUnion"/>) r
+        <include refid="activityWhere"/>
+    </select>
+
+    <!-- Detail: same scope, keyed by REF_NO (the filter carries companyId, userId, refNo). -->
+    <select id="findByRefNo" resultType="id.co.bni.direct.transaction.entity.ActivityRows$ActivityRow">
+        <include refid="activityColumns"/>
+        <include refid="activityWhere"/>
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+</mapper>

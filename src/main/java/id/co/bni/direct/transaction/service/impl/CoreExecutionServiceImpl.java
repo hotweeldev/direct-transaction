@@ -1,6 +1,7 @@
 package id.co.bni.direct.transaction.service.impl;
 
 import id.co.bni.direct.transaction.entity.TransferRows.BaseFtInsert;
+import id.co.bni.direct.transaction.entity.TransferRows.BankLimitRow;
 import id.co.bni.direct.transaction.entity.TransferRows.UsageLockRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ActionInsert;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ExecutionTaskRow;
@@ -146,6 +147,10 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                 ? task : null;
     }
 
+    private static BigDecimal nvl(BigDecimal value) {
+        return value == null ? BigDecimal.ZERO : value;
+    }
+
     /** TX-B body. Throws {@link CoreRefusedException} to roll this transaction back. */
     private ExecutionResult work(ExecutionTaskRow task, String executedBy) {
         BigDecimal amount = task.trxAmt();
@@ -165,6 +170,22 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         if (breaches(groupLimit, amount)) {
             return fail(task, executedBy, "FAILED",
                     "Limit grup pengguna tidak lagi mencukupi saat rilis.");
+        }
+
+        // Decision A (2026-09-01): the BANK's per-transaction ceilings are re-read at release
+        // so a limit the bank lowered while the task waited for approval wins over the value
+        // the maker was validated against. The authorization STRUCTURE (matrix band, levels,
+        // frozen candidates, maker scheme) deliberately stays as it was at submit - decision B.
+        BankLimitRow bankLimit = transferMapper.findBankLimit(task.srvcCd(), task.trxCcyCd());
+        if (bankLimit != null && (amount.compareTo(nvl(bankLimit.minAmtLmt())) < 0
+                || (bankLimit.maxAmtLmt() != null && amount.compareTo(bankLimit.maxAmtLmt()) > 0))) {
+            return fail(task, executedBy, "FAILED",
+                    "Limit transaksi bank berubah sejak transaksi dibuat; nominal tidak lagi diizinkan.");
+        }
+        BigDecimal debitLimit = transferMapper.findAccountDebitLimit(task.corpId(), task.remAcctNo());
+        if (debitLimit != null && amount.compareTo(debitLimit) > 0) {
+            return fail(task, executedBy, "FAILED",
+                    "Limit debit rekening sumber berubah sejak transaksi dibuat; nominal tidak lagi diizinkan.");
         }
 
         // Usage increments at release - the recorded decision. Same transaction as the

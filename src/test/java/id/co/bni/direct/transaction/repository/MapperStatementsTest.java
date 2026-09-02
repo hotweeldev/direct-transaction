@@ -4,6 +4,7 @@ import java.io.InputStream;
 import java.util.Arrays;
 import java.util.List;
 
+import id.co.bni.direct.transaction.repository.mapper.ActivityMapper;
 import id.co.bni.direct.transaction.repository.mapper.ExecutionOutboxMapper;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
@@ -57,5 +58,10 @@ class MapperStatementsTest {
     @Test
     void everyExecutionOutboxMapperMethodHasAStatement() {
         assertEveryMethodHasAStatement(ExecutionOutboxMapper.class);
+    }
+
+    @Test
+    void everyActivityMapperMethodHasAStatement() {
+        assertEveryMethodHasAStatement(ActivityMapper.class);
     }
 }
