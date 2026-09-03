@@ -278,11 +278,164 @@
                              FINALIZE_PAYMENT_FLAG, CREATED_BY, CREATED_DT, UPDATED_BY)
         VALUES (#{id}, N'com.aprisma.product.gcm.common.model.InHouseFT', 1, #{mnuCd},
                 #{srvcCd}, 999, #{refNo}, #{trxRefNo},
-                #{remAcctNo}, #{benAcctNo}, #{benAcctNm}, N'IDR',
-                #{trxAmt}, N'IDR', N'1', SYSDATE,
+                #{remAcctNo}, #{benAcctNo}, #{benAcctNm}, #{trxCcyCd},
+                #{trxAmt}, #{trxCcyCd}, N'1', SYSDATE,
                 0, 0, N'Y', NULL,
                 N'N', #{createdBy}, SYSDATE, #{updatedBy})
     </insert>
+
+    <!--
+      The booking row of an executed DOMESTIC (LLG/RTGS) transfer. Same constant spine as
+      insertBaseFt (IDX=999, IS_PROCESSED='Y', IDR both legs - P1 is single-leg IDR only)
+      plus the beneficiary-bank block the legacy CTX_MFT_LLG/RTGS rows carry: the chosen
+      COM_MT_DOM_BANK id, addresses, residency flags in the method's own vocabulary,
+      BEN_TYPE (LLG only, NULL for RTGS) and the final-bank BIC. CLASS is a parameter
+      because it differs per product. CH_TYP_* charge columns stay NULL until P4.
+
+      P6: for a cross-currency two-leg transfer this is the LEG-2 outward booking, and it
+      also carries ACCT_NO_SIMSEM (the holding account it was sent FROM) and
+      JOURNAL_NO_SIMSEM (leg 1's core journal, the credit INTO that account). Both are
+      NULL for an ordinary single-leg LLG/RTGS/ONLINE row.
+    -->
+    <!-- P3 Transfer ke Virtual Account: the executed record goes to the legacy VA booking
+         table, not BASE_FT (legacy kept VA payments apart). Constant columns copy the
+         executed rows in the legacy sample data: VA_TRX_TYPE 'o' (open payment - the
+         customer types the amount, which is the rewrite's contract too), PROCESS_FLAG 'Y'
+         (processed), STANDING_INSTRUCTION '1', NOTIFICATION_FLAG '1', the display labels
+         "No.VA" / "Nama" / "Nominal" / "Biaya admin". BILLING_NO repeats the VA number as
+         the samples do. No journal column exists here; the journal is on TRX_TASK. -->
+    <insert id="insertVirtualAccountFt">
+        INSERT INTO VIRTUAL_ACCOUNT_FT (ID, INSTRUCTION_DT, CREATED_BY, CREATED_DT, CORP_ID,
+                                        VA_NO, CURRENCY, TOTAL_AMOUNT, BILLING_NO, BILLING_LABEL,
+                                        VA_NAME, VA_LABEL, VA_TRX_TYPE,
+                                        BILLED_AMT_LABEL, BILLED_AMT_VALUE, BILLED_AMOUNT,
+                                        FEE_AMT_LABEL, FEE_AMT_VALUE, FEE_AMOUNT,
+                                        ACC_NO_TO, DEBITED_ACC_NO, REF_NO,
+                                        STANDING_INSTRUCTION, NOTIFICATION_FLAG, PROCESS_FLAG,
+                                        TRX_REF_NO, UPDATED_BY, UPDATED_DT, REMARK)
+        VALUES (#{id}, SYSDATE, #{createdBy}, SYSDATE, #{corpId},
+                #{vaNo}, #{currency}, #{totalAmt}, #{vaNo}, N'No.VA',
+                #{vaName}, N'Nama', N'o',
+                N'Nominal', #{billedAmtValue}, #{billedAmt},
+                N'Biaya admin', #{feeAmtValue}, #{feeAmt},
+                NULL, #{debitedAcctNo}, #{refNo},
+                N'1', N'1', N'Y',
+                #{trxRefNo}, #{updatedBy}, SYSDATE, #{remark})
+    </insert>
+
+    <insert id="insertBaseFtDom">
+        INSERT INTO BASE_FT (ID, CLASS, VERSION, MNU_CD, SRVC_CD, IDX, REF_NO, TRX_REF_NO,
+                             REM_ACCT_NO, BEN_ACCT_NO, BEN_ACCT_NM, BEN_ACCT_CCY_CD,
+                             TRX_AMT, TRX_CCY_CD, INSTRUCTION_MODE, INSTRUCTION_DT,
+                             RECUR_PARAM, RECUR_CTR, IS_PROCESSED, IS_NOTIFY_BEN,
+                             FINALIZE_PAYMENT_FLAG,
+                             BEN_DOM_BNK_ID, BEN_ADDR_1, BEN_ADDR_2, BEN_ADDR_3,
+                             LLD_IS_REM_RES, LLD_IS_BEN_RES, BEN_TYPE, BIC_SWIFT_CD,
+                             ACCT_NO_SIMSEM, JOURNAL_NO_SIMSEM,
+                             CREATED_BY, CREATED_DT, UPDATED_BY)
+        VALUES (#{id}, #{ftClass}, 1, #{mnuCd},
+                #{srvcCd}, 999, #{refNo}, #{trxRefNo},
+                #{remAcctNo}, #{benAcctNo}, #{benAcctNm}, N'IDR',
+                #{trxAmt}, N'IDR', N'1', SYSDATE,
+                0, 0, N'Y', NULL,
+                N'N',
+                #{benDomBnkId}, #{benAddr1}, #{benAddr2}, #{benAddr3},
+                #{lldIsRemRes}, #{lldIsBenRes}, #{benType}, #{bicSwiftCd},
+                #{acctNoSimsem}, #{journalNoSimsem},
+                #{createdBy}, SYSDATE, #{updatedBy})
+    </insert>
+
+    <!--
+      COM_MT_DOM_BANK - direct-bankmodule's DomesticBank master, READ ONLY here (house
+      rule: point at the legacy table, never copy it). CD is EITHER a 7-digit sandi
+      kliring (~170 live rows) OR a BIC (~141); MEMBER_CD carries the BIC where present.
+      No single row reliably carries both codes, so each picker lists only rows that can
+      actually be routed for its method, and the transfer takes both codes from the ONE
+      row the user picked.
+    -->
+    <select id="findDomBank" resultType="id.co.bni.direct.transaction.entity.TransferRows$DomBankRow">
+        SELECT ID        AS "id",
+               CD        AS "cd",
+               NM        AS "nm",
+               MEMBER_CD AS "memberCd",
+               ONLINE_CD AS "onlineCd"
+        FROM COM_MT_DOM_BANK
+        WHERE ID = #{id}
+          AND IS_DELETE = N'N'
+    </select>
+
+    <!-- Kliring needs BOTH the 7-digit sandi (clearing code) and an 8-char BIC
+         (finalBankBic, mandatory upstream): only rows carrying both are listed - 23 on
+         the DEV copy. -->
+    <select id="findClearingBanks" resultType="id.co.bni.direct.transaction.entity.TransferRows$DomBankRow">
+        SELECT ID        AS "id",
+               CD        AS "cd",
+               NM        AS "nm",
+               MEMBER_CD AS "memberCd",
+               ONLINE_CD AS "onlineCd"
+        FROM COM_MT_DOM_BANK
+        WHERE IS_DELETE = N'N'
+          AND REGEXP_LIKE(CD, '^[0-9]{7}$')
+          AND MEMBER_CD IS NOT NULL
+        ORDER BY NM
+    </select>
+
+    <select id="findRtgsBanks" resultType="id.co.bni.direct.transaction.entity.TransferRows$DomBankRow">
+        SELECT ID        AS "id",
+               CD        AS "cd",
+               NM        AS "nm",
+               MEMBER_CD AS "memberCd",
+               ONLINE_CD AS "onlineCd"
+        FROM COM_MT_DOM_BANK
+        WHERE IS_DELETE = N'N'
+          AND (MEMBER_CD IS NOT NULL OR NOT REGEXP_LIKE(CD, '^[0-9]+$'))
+        ORDER BY NM
+    </select>
+
+    <!-- The ONLINE (RTOL / ATM Bersama) picker: live rows carrying the 3-digit interbank
+         code the switch routes by (ONLINE_CD) - 29 on the DEV copy. Neither the sandi
+         nor the BIC matters for this method. -->
+    <select id="findOnlineBanks" resultType="id.co.bni.direct.transaction.entity.TransferRows$DomBankRow">
+        SELECT ID        AS "id",
+               CD        AS "cd",
+               NM        AS "nm",
+               MEMBER_CD AS "memberCd",
+               ONLINE_CD AS "onlineCd"
+        FROM COM_MT_DOM_BANK
+        WHERE IS_DELETE = N'N'
+          AND ONLINE_CD IS NOT NULL
+        ORDER BY NM
+    </select>
+
+    <!-- SYS_PARAM display parameters of the domestic methods (SYS_PARAM_TRF_SME_LLG /
+         _RTGS): VALUE is 'duration|min|max|fee' with IDR-formatted amount tokens, parsed
+         leniently in SysParamMethodInfo. Read-only; a missing or soft-deleted row simply
+         answers null and the FE hint degrades to the configured fee alone. -->
+    <select id="findSysParamValue" resultType="string">
+        SELECT VALUE
+        FROM SYS_PARAM
+        WHERE CD = #{cd}
+          AND IS_DELETE = N'N'
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <!-- The sender block of the kliring/RTGS operations comes from the corporate's own
+         master data, not from user input. -->
+    <select id="findCorpContact" resultType="id.co.bni.direct.transaction.entity.TransferRows$CorpContactRow">
+        SELECT NM       AS "nm",
+               ADDR_1   AS "addr1",
+               PHONE_NO AS "phoneNo"
+        FROM CORP
+        WHERE ID = #{companyId}
+    </select>
+
+    <!-- The corporate CIF (P5): the trxPBI underlying check is keyed by the customer's
+         CIF, which legacy stores on the CORP row itself. -->
+    <select id="findCorpHostCif" resultType="string">
+        SELECT HOST_CIF_ID
+        FROM CORP
+        WHERE ID = #{companyId}
+    </select>
 
     <!--
       TRX_REF_NO_SEQUENCE is the LEGACY table, shared with the parallel legacy application

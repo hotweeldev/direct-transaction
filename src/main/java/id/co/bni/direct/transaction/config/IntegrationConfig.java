@@ -15,7 +15,8 @@ import org.springframework.context.annotation.Configuration;
  * properties they need.
  */
 @Configuration
-@EnableConfigurationProperties({IntegrationProperties.class, AuthenticatorProperties.class})
+@EnableConfigurationProperties({IntegrationProperties.class, AuthenticatorProperties.class,
+        TransferTypeProperties.class})
 public class IntegrationConfig {
 
     @Bean

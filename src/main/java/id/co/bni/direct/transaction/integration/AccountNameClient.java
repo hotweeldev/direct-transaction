@@ -28,6 +28,7 @@ public class AccountNameClient {
     private static final Logger log = LoggerFactory.getLogger(AccountNameClient.class);
 
     private static final String NAME_PATH = "/internal/v1/core/accounts/name";
+    private static final String SHORT_DETAILS_PATH = "/internal/v1/core/accounts/short-details";
 
     private final IntegrationProperties properties;
     private final ObjectMapper objectMapper;
@@ -101,5 +102,66 @@ public class AccountNameClient {
                 node.path("accountName").asText(null),
                 node.path("currency").asText(null),
                 node.path("status").asText(null));
+    }
+
+    /**
+     * Short details for one account (integration section 15) - the P5 source-account
+     * probe: {@code currency} decides whether a Transfer ke BNI is cross-currency,
+     * {@code productType} (core banking's accountProductType, DEP/LON) decides whether
+     * execution routes to LoanTransfer.
+     */
+    public record ShortDetails(String accountNumber, String accountName, String currency,
+                               String status, String productType) {
+    }
+
+    /**
+     * The account's short details, or throws exactly like {@link #fetchAccountName}:
+     * 404 for an unknown account, 503 when the hop is disabled, unreachable or
+     * answering something unexpected. Load-bearing on the multi-currency submit path -
+     * a cross corridor must never be guessed from a hop that did not answer.
+     */
+    public ShortDetails fetchShortDetails(String accountNumber) {
+        if (!properties.isEnabled()) {
+            throw new ServiceUnavailableException(
+                    "Layanan inquiry rekening sedang tidak tersedia. Silakan coba lagi nanti.");
+        }
+        try {
+            ObjectNode body = objectMapper.createObjectNode();
+            body.put("accountNumber", accountNumber);
+            return restClient.post()
+                    .uri(SHORT_DETAILS_PATH)
+                    .header("X-Api-Key", properties.getApiKey())
+                    .header("X-Correlation-Id", CorrelationContext.currentCorrelationId())
+                    .body(body)
+                    .exchange((request, response) -> {
+                        int status = response.getStatusCode().value();
+                        if (status == 404) {
+                            throw new NotFoundException("Rekening sumber tidak ditemukan.");
+                        }
+                        if (status < 200 || status >= 300) {
+                            log.warn("short-details inquiry answered {}", status);
+                            throw new ServiceUnavailableException(
+                                    "Layanan inquiry rekening sedang bermasalah. Silakan coba lagi nanti.");
+                        }
+                        JsonNode root = response.bodyTo(JsonNode.class);
+                        if (root == null || root.isMissingNode() || root.isNull()) {
+                            throw new ServiceUnavailableException(
+                                    "Layanan inquiry rekening menjawab dengan format yang tidak dikenal.");
+                        }
+                        JsonNode node = root.has("data") ? root.path("data") : root;
+                        return new ShortDetails(
+                                node.path("accountNumber").asText(null),
+                                node.path("accountName").asText(null),
+                                node.path("currency").asText(null),
+                                node.path("status").asText(null),
+                                node.path("productType").asText(null));
+                    });
+        } catch (NotFoundException | ServiceUnavailableException e) {
+            throw e;
+        } catch (Exception e) {
+            log.warn("short-details inquiry call failed: {}", e.getMessage());
+            throw new ServiceUnavailableException(
+                    "Layanan inquiry rekening sedang tidak tersedia. Silakan coba lagi nanti.");
+        }
     }
 }

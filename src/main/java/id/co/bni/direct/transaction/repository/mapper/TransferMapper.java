@@ -100,6 +100,40 @@ public interface TransferMapper {
     /** The legacy booking row of a successfully executed transfer. */
     int insertBaseFt(TransferRows.BaseFtInsert row);
 
+    /** The booking row of an executed DOMESTIC (LLG/RTGS) transfer - P1's column set. */
+    int insertBaseFtDom(TransferRows.BaseFtDomInsert row);
+
+    /**
+     * The executed Transfer ke Virtual Account record, into the legacy
+     * {@code VIRTUAL_ACCOUNT_FT} table (P3) - legacy never wrote VA payments to BASE_FT.
+     */
+    int insertVirtualAccountFt(TransferRows.VaFtInsert row);
+
+    /** One COM_MT_DOM_BANK row by ID (live rows only), or null. */
+    TransferRows.DomBankRow findDomBank(@Param("id") String id);
+
+    /**
+     * The LLG bank picker: live rows whose CD is a 7-digit sandi kliring AND that carry
+     * a member BIC - both are mandatory on the kliring operation (clearing code +
+     * finalBankBic), so a row missing either cannot be routed.
+     */
+    List<TransferRows.DomBankRow> findClearingBanks();
+
+    /** The RTGS bank picker: live rows that yield a BIC (MEMBER_CD, or a BIC-shaped CD). */
+    List<TransferRows.DomBankRow> findRtgsBanks();
+
+    /** The ONLINE (RTOL / ATM Bersama) picker: live rows carrying a 3-digit ONLINE_CD. */
+    List<TransferRows.DomBankRow> findOnlineBanks();
+
+    /** SYS_PARAM.VALUE by CD (live rows only), or null when missing or soft-deleted. */
+    String findSysParamValue(@Param("cd") String cd);
+
+    /** CORP's name/address/phone - the sender block of the kliring/RTGS operations. */
+    TransferRows.CorpContactRow findCorpContact(@Param("companyId") String companyId);
+
+    /** CORP.HOST_CIF_ID - the corporate CIF the trxPBI underlying check is keyed by (P5). */
+    String findCorpHostCif(@Param("companyId") String companyId);
+
     /**
      * The current counter for (SERVICE_CD, CORP_ID), locked FOR UPDATE - the lock is what
      * keeps this service and the parallel legacy application from minting the same

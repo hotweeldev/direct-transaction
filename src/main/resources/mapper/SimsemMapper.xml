@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  SIMSEM_ACCOUNT - the pool of holding accounts a cross-currency Transfer ke Bank Lain
+  routes leg 1 into (P6). A legacy DIRECT table, read only here. Its rows are DATA and are
+  seeded per environment by direct DML (CREATED_BY 'P6SEED'), never by a migration. The
+  table carries no active flag, so every registered row counts as available - the pool is
+  managed by inserting/removing rows.
+-->
+<mapper namespace="id.co.bni.direct.transaction.repository.mapper.SimsemMapper">
+
+    <!-- Every registered simsem account for a service+currency. Ordered by ACCOUNT_NO so
+         a load tie breaks deterministically (the same account wins until its in-flight
+         count rises above a peer's). -->
+    <select id="findActiveSimsem" resultType="id.co.bni.direct.transaction.entity.SimsemRows$SimsemAccount">
+        SELECT ID            AS "id",
+               SRVC_CD       AS "srvcCd",
+               SRVC_ALIAS    AS "srvcAlias",
+               ACCOUNT_NO    AS "accountNo",
+               ACCOUNT_CCY   AS "accountCcy"
+        FROM SIMSEM_ACCOUNT
+        WHERE SRVC_CD = #{srvcCd}
+          AND ACCOUNT_CCY = #{ccy}
+        ORDER BY ACCOUNT_NO
+    </select>
+
+    <!-- In-flight load per simsem account: tasks that completed leg 1 into the account and
+         have not yet reached a terminal two-leg state. This is the count least-in-flight
+         selection minimizes. Accounts with none simply do not appear (the pool service
+         reads a missing account as zero). -->
+    <select id="countInFlightBySimsem" resultType="id.co.bni.direct.transaction.entity.SimsemRows$SimsemLoad">
+        SELECT SIMSEM_ACCT_NO AS "accountNo",
+               COUNT(*)       AS "inFlight"
+        FROM TRX_TASK
+        WHERE SIMSEM_ACCT_NO IS NOT NULL
+          AND TWO_LEG_STATE = N'LEG1_DONE'
+        GROUP BY SIMSEM_ACCT_NO
+    </select>
+
+</mapper>

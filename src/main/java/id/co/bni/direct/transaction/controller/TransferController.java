@@ -1,12 +1,20 @@
 package id.co.bni.direct.transaction.controller;
 
 import id.co.bni.direct.transaction.dto.request.TransferRequests.InquiryRequest;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.InterbankInquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.OtpChallengeRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.SubmitTransferRequest;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.VaInquiryRequest;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.BankResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.InquiryResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.InterbankInquiryResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.MethodInfoResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.OtpChallengeResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.SubmitResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.TaskDetailResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.VaInquiryResponse;
+
+import java.util.List;
 import id.co.bni.direct.transaction.security.RequiresPermission;
 import id.co.bni.direct.transaction.security.TokenIdentity;
 import id.co.bni.direct.transaction.service.TransferService;
@@ -64,6 +72,36 @@ public class TransferController {
         return ResponseEntity.ok(transferService.inquiry(companyId, request));
     }
 
+    /**
+     * The interbank (ONLINE / RTOL / ATM Bersama) beneficiary inquiry - the FE's
+     * "Periksa" step before an ONLINE submit (P2), proxied to direct-integration's
+     * switch hop. Bound to the caller's identity like the OTP challenge: the body's
+     * {@code userId} may not name somebody else once auth is on.
+     */
+    @PostMapping("/interbank-inquiry")
+    public ResponseEntity<InterbankInquiryResponse> interbankInquiry(
+            @PathVariable String companyId,
+            @Valid @RequestBody InterbankInquiryRequest request,
+            HttpServletRequest servletRequest) {
+        TokenIdentity.requireSameUser(servletRequest, request.userId());
+        return ResponseEntity.ok(transferService.interbankInquiry(companyId, request));
+    }
+
+    /**
+     * The Transfer ke Virtual Account billing inquiry (P3) - the FE's "Periksa" step
+     * before a VA submit, proxied to direct-integration's VA hop. Bound to the caller's
+     * identity like the interbank inquiry; the maker must hold debit rights on the
+     * source account (the VA service keys the inquiry on the paying account).
+     */
+    @PostMapping("/va/inquiry")
+    public ResponseEntity<VaInquiryResponse> vaInquiry(
+            @PathVariable String companyId,
+            @Valid @RequestBody VaInquiryRequest request,
+            HttpServletRequest servletRequest) {
+        TokenIdentity.requireSameUser(servletRequest, request.userId());
+        return ResponseEntity.ok(transferService.vaInquiry(companyId, request));
+    }
+
     /** A fresh OTP challenge for the maker, from the UMAS authenticator. */
     @PostMapping("/otp/challenge")
     public ResponseEntity<OtpChallengeResponse> otpChallenge(@PathVariable String companyId,
@@ -83,6 +121,34 @@ public class TransferController {
         TokenIdentity.requireSameUser(servletRequest, request.userId());
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(transferService.submit(companyId, actor, request));
+    }
+
+    /**
+     * The destination-bank picker for the domestic methods (P1). {@code method} is LLG
+     * or RTGS; each answers only banks that can actually be routed for that method (see
+     * the mapper). Read-only, from the legacy COM_MT_DOM_BANK master - guarded by the
+     * same {@code transfer-bni} resource as the rest of this controller (no new RBAC
+     * resource is introduced; whether Transfer ke Bank Lain warrants its own
+     * {@code transfer-other} enforcement is a UMAS-catalog decision, noted, not made
+     * here).
+     */
+    @GetMapping("/banks")
+    public ResponseEntity<List<BankResponse>> banks(@PathVariable String companyId,
+                                                    @RequestParam String method) {
+        return ResponseEntity.ok(transferService.banks(companyId, method));
+    }
+
+    /**
+     * The method's display parameters (P1) - estimated duration, min/max nominal and the
+     * fee - from the legacy SYS_PARAM_TRF_SME_* rows, so the FE validates the RTGS/LLG
+     * minimum and shows the fee without hardcoding either value. Read-only, guarded like
+     * {@code /banks} by the controller-level {@code transfer-bni} resource; a
+     * {@code method} other than LLG/RTGS is the same 422 as there.
+     */
+    @GetMapping("/method-info")
+    public ResponseEntity<MethodInfoResponse> methodInfo(@PathVariable String companyId,
+                                                         @RequestParam String method) {
+        return ResponseEntity.ok(transferService.methodInfo(companyId, method));
     }
 
     /** Task detail with its stages - the success/status screen. */

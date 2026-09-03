@@ -1,15 +1,23 @@
 package id.co.bni.direct.transaction.service.impl;
 
+import id.co.bni.direct.transaction.config.TransferTypeProperties;
+import id.co.bni.direct.transaction.entity.TransferRows.BaseFtDomInsert;
 import id.co.bni.direct.transaction.entity.TransferRows.BaseFtInsert;
 import id.co.bni.direct.transaction.entity.TransferRows.BankLimitRow;
+import id.co.bni.direct.transaction.entity.TransferRows.CorpContactRow;
 import id.co.bni.direct.transaction.entity.TransferRows.UsageLockRow;
+import id.co.bni.direct.transaction.entity.TransferRows.VaFtInsert;
+import id.co.bni.direct.transaction.entity.SimsemRows.SimsemAccount;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ActionInsert;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ExecutionTaskRow;
 import id.co.bni.direct.transaction.integration.CoreTransferClient;
+import id.co.bni.direct.transaction.integration.CoreTransferClient.InterbankOutcome;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.TransferOutcome;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
 import id.co.bni.direct.transaction.service.ExecutionService;
+import id.co.bni.direct.transaction.service.SimsemPool;
+import id.co.bni.direct.transaction.service.TransferType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Primary;
@@ -51,8 +59,24 @@ import java.util.UUID;
  *     necessity: the verdict must survive while the work must not.</li>
  * </ol>
  *
- * <p>Reconciliation of UNKNOWN tasks via direct-integration's /transfers/status is a
- * documented TODO - deliberately not built here; the contract's rule that a timed-out
+ * <p><b>P6, the two-leg flow.</b> A cross-currency Transfer ke Bank Lain (LLG/RTGS with
+ * a valas source frozen on the V7 columns) cannot go straight out - kliring and RTGS are
+ * IDR-only. It runs inside TX-B as two core calls through a simsem (holding) account
+ * chosen from {@link SimsemPool}: leg 1 {@code DepTransferCross} customer valas account
+ * into the simsem IDR account (amount + fee), leg 2 kliring/RTGS out of the simsem
+ * account with the ordinary single-leg payload. Between them {@code markLeg1Done} is
+ * COMMITTED in its own transaction, so the in-flight count and reconciliation see leg 1
+ * even if this thread dies before leg 2 answers. Verdicts: leg 1 refused = FAILED (TX-B
+ * rolled back, nothing moved); leg 1 UNKNOWN = UNKNOWN with the chosen account pinned;
+ * leg 2 UNKNOWN = UNKNOWN + LEG1_DONE and NEVER a refund (the money may be on its way
+ * to the other bank - {@code ReconciliationServiceImpl} owns it); leg 2 refused =
+ * auto-refund from the simsem account (task 6.4): refund confirmed = FAILED +
+ * REFUND_DONE with TX-B rolled back (usage undone, both journals in the note), refund
+ * refused/UNKNOWN = UNKNOWN + REFUND_FAILED with usage kept (funds may be stranded in
+ * the simsem account - the note says which).
+ *
+ * <p>Reconciliation of single-leg UNKNOWN tasks via direct-integration's
+ * /transfers/status remains a documented TODO; the contract's rule that a timed-out
  * transfer is never resent is what this class enforces in the meantime.
  */
 @Service
@@ -67,15 +91,24 @@ public class CoreExecutionServiceImpl implements ExecutionService {
     private final TrxTaskMapper trxTaskMapper;
     private final TransferMapper transferMapper;
     private final CoreTransferClient coreTransferClient;
+    private final TransferTypeProperties transferTypeProperties;
+    private final SimsemPool simsemPool;
+    private final SimsemRefunder simsemRefunder;
     private final TransactionTemplate ownTransaction;
 
     public CoreExecutionServiceImpl(TrxTaskMapper trxTaskMapper,
                                     TransferMapper transferMapper,
                                     CoreTransferClient coreTransferClient,
+                                    TransferTypeProperties transferTypeProperties,
+                                    SimsemPool simsemPool,
+                                    SimsemRefunder simsemRefunder,
                                     PlatformTransactionManager transactionManager) {
         this.trxTaskMapper = trxTaskMapper;
         this.transferMapper = transferMapper;
         this.coreTransferClient = coreTransferClient;
+        this.transferTypeProperties = transferTypeProperties;
+        this.simsemPool = simsemPool;
+        this.simsemRefunder = simsemRefunder;
         this.ownTransaction = new TransactionTemplate(transactionManager);
         this.ownTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
@@ -111,9 +144,22 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         try {
             return ownTransaction.execute(tx -> work(task, executedBy));
         } catch (CoreRefusedException e) {
-            // TX-B rolled back: increments and ref-no counter undone. TX-C: the verdict.
-            return ownTransaction.execute(tx -> fail(task, executedBy, "FAILED",
-                    "Core banking menolak transaksi: " + e.getMessage()));
+            // TX-B rolled back: increments and ref-no counter undone. TX-C: the verdict,
+            // plus (ONLINE) whatever trace the switch answered the refusal with.
+            return ownTransaction.execute(tx -> {
+                traceInterbank(task.id(), e.retrievalRefNo, e.responseCode);
+                return fail(task, executedBy, "FAILED",
+                        "Core banking menolak transaksi: " + e.getMessage());
+            });
+        } catch (TwoLegRefundedException e) {
+            // P6: leg 2 was refused and the refund out of the simsem account landed. TX-B
+            // rolled back (usage undone, nothing booked); TX-C writes FAILED and pins the
+            // two-leg state - LEG1_DONE was committed separately and is now superseded.
+            return ownTransaction.execute(tx -> {
+                ExecutionResult verdict = fail(task, executedBy, "FAILED", e.getMessage());
+                trxTaskMapper.updateTwoLegState(task.id(), "REFUND_DONE", executedBy);
+                return verdict;
+            });
         } catch (PostTransferException e) {
             // The money moved (we hold a journal) but committing the bookkeeping failed.
             // Never FAILED - the journal is preserved in the action note for the
@@ -154,20 +200,31 @@ public class CoreExecutionServiceImpl implements ExecutionService {
     /** TX-B body. Throws {@link CoreRefusedException} to roll this transaction back. */
     private ExecutionResult work(ExecutionTaskRow task, String executedBy) {
         BigDecimal amount = task.trxAmt();
+        // The DEBITED total: amount + the fee frozen at submit (null for in-house
+        // tasks). P5: a cross task freezes the customer-typed debit amount and the
+        // source currency on V7 columns - every ceiling re-check and usage increment
+        // then sees THAT side, in THAT currency, mirroring the submit-time ladder.
+        // The core call itself sends the frozen amounts, with the fee in its own field.
+        BigDecimal debitSide = task.debitAmt() != null ? task.debitAmt() : amount;
+        String limitCcy = task.debitCcyCd() != null ? task.debitCcyCd() : task.trxCcyCd();
+        // P6: on a two-leg task the flat IDR fee is INSIDE the leg-1 credit the frozen
+        // valas debit amount pays for (SimsemRefunder.leg1Credit), so the ceilings see
+        // the debit amount alone - the same figure the submit ladder validated.
+        BigDecimal totalDebit = isTwoLeg(task) ? debitSide : debitSide.add(nvl(task.feeAmt()));
 
         // Re-validate the two ceilings under FOR UPDATE before incrementing: usage moved
         // between submit and release. Only rows that exist bind - same resolution the
         // submit validation used.
         UsageLockRow corpLimit = transferMapper.lockCorpLimit(
-                task.corpId(), task.srvcCd(), task.trxCcyCd());
-        if (breaches(corpLimit, amount)) {
+                task.corpId(), task.srvcCd(), limitCcy);
+        if (breaches(corpLimit, totalDebit)) {
             return fail(task, executedBy, "FAILED",
                     "Limit harian perusahaan tidak lagi mencukupi saat rilis.");
         }
         String makerGroupId = transferMapper.findUserGroupId(task.makerUserId());
         UsageLockRow groupLimit = makerGroupId == null ? null
-                : transferMapper.lockGroupLimit(makerGroupId, task.srvcCd(), task.trxCcyCd());
-        if (breaches(groupLimit, amount)) {
+                : transferMapper.lockGroupLimit(makerGroupId, task.srvcCd(), limitCcy);
+        if (breaches(groupLimit, totalDebit)) {
             return fail(task, executedBy, "FAILED",
                     "Limit grup pengguna tidak lagi mencukupi saat rilis.");
         }
@@ -176,29 +233,53 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         // so a limit the bank lowered while the task waited for approval wins over the value
         // the maker was validated against. The authorization STRUCTURE (matrix band, levels,
         // frozen candidates, maker scheme) deliberately stays as it was at submit - decision B.
-        BankLimitRow bankLimit = transferMapper.findBankLimit(task.srvcCd(), task.trxCcyCd());
-        if (bankLimit != null && (amount.compareTo(nvl(bankLimit.minAmtLmt())) < 0
-                || (bankLimit.maxAmtLmt() != null && amount.compareTo(bankLimit.maxAmtLmt()) > 0))) {
+        BankLimitRow bankLimit = transferMapper.findBankLimit(task.srvcCd(), limitCcy);
+        if (bankLimit != null && (totalDebit.compareTo(nvl(bankLimit.minAmtLmt())) < 0
+                || (bankLimit.maxAmtLmt() != null && totalDebit.compareTo(bankLimit.maxAmtLmt()) > 0))) {
             return fail(task, executedBy, "FAILED",
                     "Limit transaksi bank berubah sejak transaksi dibuat; nominal tidak lagi diizinkan.");
         }
         BigDecimal debitLimit = transferMapper.findAccountDebitLimit(task.corpId(), task.remAcctNo());
-        if (debitLimit != null && amount.compareTo(debitLimit) > 0) {
+        if (debitLimit != null && totalDebit.compareTo(debitLimit) > 0) {
             return fail(task, executedBy, "FAILED",
                     "Limit debit rekening sumber berubah sejak transaksi dibuat; nominal tidak lagi diizinkan.");
+        }
+
+        // P6: a two-leg task needs a simsem account BEFORE anything is incremented - an
+        // empty pool is a plain refusal with nothing to undo, never a core call.
+        SimsemAccount simsem = null;
+        if (isTwoLeg(task)) {
+            simsem = simsemPool.select(task.srvcCd(), "IDR");
+            if (simsem == null) {
+                return fail(task, executedBy, "FAILED",
+                        "Rekening simsem belum terdaftar untuk layanan ini.");
+            }
         }
 
         // Usage increments at release - the recorded decision. Same transaction as the
         // core call: a refusal rolls them back, a timeout commits them.
         if (corpLimit != null) {
-            transferMapper.incrementCorpLimitUsage(corpLimit.id(), amount);
+            transferMapper.incrementCorpLimitUsage(corpLimit.id(), totalDebit);
         }
         if (groupLimit != null) {
-            transferMapper.incrementGroupLimitUsage(groupLimit.id(), amount);
+            transferMapper.incrementGroupLimitUsage(groupLimit.id(), totalDebit);
         }
 
-        TransferOutcome outcome = coreTransferClient.transfer(
-                task.remAcctNo(), task.benAcctNo(), amount, task.trxCcyCd(), task.remark1());
+        // P2: the ONLINE (RTOL / ATM Bersama) type rides the interbank switch protocol,
+        // whose verdict carries a trace (RRN, response code) instead of a core journal.
+        if (TransferType.fromServiceCode(task.srvcCd()) == TransferType.ONLINE) {
+            return interbankWork(task, executedBy, amount);
+        }
+        // P3: Transfer ke Virtual Account rides the VA billing service - its own wire and
+        // its own legacy booking table; success is the service's journalNum, nothing else.
+        if (TransferType.fromServiceCode(task.srvcCd()) == TransferType.VA) {
+            return virtualAccountWork(task, executedBy, amount);
+        }
+        if (simsem != null) {
+            return twoLegWork(task, executedBy, amount, simsem);
+        }
+
+        TransferOutcome outcome = callCore(task, amount, task.remAcctNo());
 
         if (outcome.status() == CoreTransferClient.Status.REFUSED) {
             throw new CoreRefusedException(outcome.message());
@@ -214,10 +295,21 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         try {
             String trxRefNo = TransferServiceImpl.nextRefNo(
                     transferMapper, task.srvcCd(), task.corpId());
-            transferMapper.insertBaseFt(new BaseFtInsert(
-                    newId(), task.menuCd(), task.srvcCd(), task.refNo(), trxRefNo,
-                    task.remAcctNo(), task.benAcctNo(), task.benAcctNm(), amount,
-                    task.makerUserId(), executedBy));
+            TransferType type = TransferType.fromServiceCode(task.srvcCd());
+            if (type.isDomestic()) {
+                transferMapper.insertBaseFtDom(new BaseFtDomInsert(
+                        newId(), ftClass(type), task.menuCd(), task.srvcCd(), task.refNo(),
+                        trxRefNo, task.remAcctNo(), task.benAcctNo(), task.benAcctNm(),
+                        amount, task.benDomBnkId(), task.benAddr1(), task.benAddr2(),
+                        task.benAddr3(), task.lldIsRemRes(), task.lldIsBenRes(),
+                        task.benType(), task.benBnkBic(), task.makerUserId(), executedBy));
+            } else {
+                transferMapper.insertBaseFt(new BaseFtInsert(
+                        newId(), task.menuCd(), task.srvcCd(), task.refNo(), trxRefNo,
+                        task.remAcctNo(), task.benAcctNo(), task.benAcctNm(), amount,
+                        task.trxCcyCd() != null ? task.trxCcyCd() : "IDR",
+                        task.makerUserId(), executedBy));
+            }
             trxTaskMapper.markExecuted(task.id(), outcome.coreJournal(), trxRefNo, executedBy);
             insertExecuteAction(task, executedBy,
                     "Transfer berhasil. coreJournal=" + outcome.coreJournal());
@@ -227,6 +319,377 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         } catch (RuntimeException e) {
             throw new PostTransferException(outcome.coreJournal(), e);
         }
+    }
+
+    /**
+     * The ONLINE tail of TX-B, entered after the shared ceiling re-checks and usage
+     * increments. One - and only one - switch attempt off the frozen payload (bank code
+     * = the 3-digit ONLINE_CD in BEN_BNK_CD; both reference fields carry the task's
+     * REF_NO). The verdict handling mirrors the core path with one deliberate twist:
+     * IN_PROCESS (responseCode 68) arrives from the client already as UNKNOWN and lands
+     * exactly like a timeout - increments and the UNKNOWN verdict COMMIT together,
+     * nothing retries, reconciliation owns the rest. The switch's trace is stored on
+     * every outcome where it answered at all.
+     */
+    private ExecutionResult interbankWork(ExecutionTaskRow task, String executedBy,
+                                          BigDecimal amount) {
+        InterbankOutcome outcome = coreTransferClient.transferInterbank(
+                new CoreTransferClient.InterbankInstruction(
+                        task.remAcctNo(), task.benAcctNo(), task.benBnkCd(),
+                        CoreTransferClient.amountString(amount),
+                        task.refNo(), task.refNo()));
+        if (outcome.status() == CoreTransferClient.Status.REFUSED) {
+            throw new CoreRefusedException(outcome.message(),
+                    outcome.retrievalRefNo(), outcome.responseCode());
+        }
+        if (outcome.status() == CoreTransferClient.Status.UNKNOWN) {
+            traceInterbank(task.id(), outcome.retrievalRefNo(), outcome.responseCode());
+            return fail(task, executedBy, "UNKNOWN", outcome.message());
+        }
+        // SUCCESS - same discipline as the core path: everything below rides on money
+        // that has already moved, so a local failure surfaces as UNKNOWN-with-reference.
+        try {
+            String trxRefNo = TransferServiceImpl.nextRefNo(
+                    transferMapper, task.srvcCd(), task.corpId());
+            transferMapper.insertBaseFtDom(new BaseFtDomInsert(
+                    newId(), ftClass(TransferType.ONLINE), task.menuCd(), task.srvcCd(),
+                    task.refNo(), trxRefNo, task.remAcctNo(), task.benAcctNo(),
+                    task.benAcctNm(), amount, task.benDomBnkId(), task.benAddr1(),
+                    task.benAddr2(), task.benAddr3(), task.lldIsRemRes(),
+                    task.lldIsBenRes(), task.benType(), null,
+                    task.makerUserId(), executedBy));
+            // No core journal exists on the switch protocol; the trace columns carry
+            // the cross-network reference instead.
+            trxTaskMapper.markExecuted(task.id(), null, trxRefNo, executedBy);
+            traceInterbank(task.id(), outcome.retrievalRefNo(), outcome.responseCode());
+            insertExecuteAction(task, executedBy,
+                    "Transfer berhasil. retrievalRefNo=" + outcome.retrievalRefNo());
+            log.info("Task {} EXECUTED (interbank): retrievalRefNo={} trxRefNo={}",
+                    task.id(), outcome.retrievalRefNo(), trxRefNo);
+            return new ExecutionResult("EXECUTED", null);
+        } catch (RuntimeException e) {
+            throw new PostTransferException(outcome.retrievalRefNo(), e);
+        }
+    }
+
+    /**
+     * A task is two-leg when it is an LLG/RTGS transfer whose frozen debit currency is
+     * not IDR. ONLINE never is (no simsem route), in-house never is (P5 handles cross
+     * in one DepTransferCross), and a same-currency domestic task has no debit block.
+     */
+    public static boolean isTwoLeg(ExecutionTaskRow task) {
+        TransferType type = TransferType.fromServiceCode(task.srvcCd());
+        return (type == TransferType.LLG || type == TransferType.RTGS)
+                && task.debitCcyCd() != null
+                && !"IDR".equalsIgnoreCase(task.debitCcyCd());
+    }
+
+    /**
+     * The P6 tail of TX-B, entered after the ceiling re-checks and usage increments with
+     * the pool account already chosen. See the class comment for the verdict table.
+     */
+    private ExecutionResult twoLegWork(ExecutionTaskRow task, String executedBy,
+                                       BigDecimal amount, SimsemAccount simsem) {
+        String simsemAcct = simsem.accountNo();
+        // Pin the chosen account before leg 1 leaves - committed on its own, so a leg-1
+        // timeout still records WHICH holding account may hold the money.
+        ownTransaction.execute(tx -> trxTaskMapper.markSimsemSelected(task.id(), simsemAcct, executedBy));
+
+        // LEG 1: customer valas account -> simsem IDR account (amount + fee), off the
+        // frozen debit amount and rate type. One attempt.
+        BigDecimal leg1Credit = SimsemRefunder.leg1Credit(task);
+        TransferOutcome leg1 = coreTransferClient.transferCrossCurrency(
+                new CoreTransferClient.CrossCurrencyInstruction(
+                        task.remAcctNo(),
+                        new CoreTransferClient.Money(
+                                CoreTransferClient.amountString(task.debitAmt()), task.debitCcyCd()),
+                        simsemAcct,
+                        new CoreTransferClient.Money(
+                                CoreTransferClient.amountString(leg1Credit), "IDR"),
+                        leg1Credit.stripTrailingZeros().toPlainString(),
+                        task.rateType(),
+                        SimsemRefunder.narrative(task),
+                        null));
+        if (leg1.status() == CoreTransferClient.Status.REFUSED) {
+            throw new CoreRefusedException(leg1.message());
+        }
+        if (leg1.status() == CoreTransferClient.Status.UNKNOWN) {
+            // Money MAY be in the simsem account. Usage stays counted, state stays NONE
+            // (leg 1 unconfirmed), the pinned account tells reconciliation where to look.
+            return fail(task, executedBy, "UNKNOWN",
+                    "Leg 1 (pemindahan ke rekening simsem " + simsemAcct
+                            + ") tidak dapat dipastikan: " + leg1.message()
+                            + " Perlu rekonsiliasi.");
+        }
+
+        // Leg 1 confirmed: LEG1_DONE + both identifiers, COMMITTED before leg 2 is sent.
+        ownTransaction.execute(tx -> trxTaskMapper.markLeg1Done(
+                task.id(), simsemAcct, leg1.coreJournal(), executedBy));
+        log.info("Task {} leg 1 done: simsem={} journal={} credit={} IDR",
+                task.id(), simsemAcct, leg1.coreJournal(), leg1Credit);
+
+        // LEG 2: the ordinary kliring/RTGS instruction, sent FROM the simsem account.
+        TransferOutcome leg2 = callCore(task, amount, simsemAcct);
+        if (leg2.status() == CoreTransferClient.Status.UNKNOWN) {
+            // NEVER a refund here: leg 2 may be on its way to the other bank.
+            return fail(task, executedBy, "UNKNOWN",
+                    "Leg 2 (transfer keluar dari rekening simsem " + simsemAcct
+                            + ") tidak dapat dipastikan: " + leg2.message()
+                            + " Dana berada di rekening simsem (jurnal leg 1 "
+                            + leg1.coreJournal() + "). Perlu rekonsiliasi.");
+        }
+        if (leg2.status() == CoreTransferClient.Status.REFUSED) {
+            // Definite refusal: the money is provably still in the simsem account.
+            // Auto-refund (task 6.4), one attempt.
+            TransferOutcome refund = simsemRefunder.refund(task, simsemAcct, leg1.coreJournal());
+            if (refund.status() == CoreTransferClient.Status.SUCCESS) {
+                throw new TwoLegRefundedException(
+                        "Core banking menolak leg 2: " + nonNull(leg2.message())
+                                + " Dana dikembalikan dari rekening simsem " + simsemAcct
+                                + " ke rekening sumber. journalLeg1=" + leg1.coreJournal()
+                                + " journalRefund=" + refund.coreJournal());
+            }
+            // Refund refused or unknown: funds may be stranded. Commit TX-B (usage kept -
+            // the conservative direction) with UNKNOWN + REFUND_FAILED.
+            ExecutionResult verdict = fail(task, executedBy, "UNKNOWN",
+                    "Core banking menolak leg 2: " + nonNull(leg2.message())
+                            + " Pengembalian dana dari rekening simsem " + simsemAcct
+                            + " GAGAL/tidak pasti: " + nonNull(refund.message())
+                            + " Dana mungkin tertahan di rekening simsem; perlu penanganan manual."
+                            + " journalLeg1=" + leg1.coreJournal());
+            trxTaskMapper.updateTwoLegState(task.id(), "REFUND_FAILED", executedBy);
+            return verdict;
+        }
+
+        // Leg 2 SUCCESS - same discipline as the single-leg path: everything below rides
+        // on money that has already moved, so a local failure surfaces as
+        // UNKNOWN-with-journal (state stays LEG1_DONE; reconciliation finds leg 2 landed).
+        try {
+            String trxRefNo = TransferServiceImpl.nextRefNo(
+                    transferMapper, task.srvcCd(), task.corpId());
+            TransferType type = TransferType.fromServiceCode(task.srvcCd());
+            transferMapper.insertBaseFtDom(new BaseFtDomInsert(
+                    newId(), ftClass(type), task.menuCd(), task.srvcCd(), task.refNo(),
+                    trxRefNo, task.remAcctNo(), task.benAcctNo(), task.benAcctNm(),
+                    amount, task.benDomBnkId(), task.benAddr1(), task.benAddr2(),
+                    task.benAddr3(), task.lldIsRemRes(), task.lldIsBenRes(),
+                    task.benType(), task.benBnkBic(), task.makerUserId(), executedBy,
+                    simsemAcct, leg1.coreJournal()));
+            trxTaskMapper.markExecuted(task.id(), leg2.coreJournal(), trxRefNo, executedBy);
+            trxTaskMapper.updateTwoLegState(task.id(), "LEG2_DONE", executedBy);
+            insertExecuteAction(task, executedBy,
+                    "Transfer berhasil (2 leg via simsem " + simsemAcct + "). coreJournal="
+                            + leg2.coreJournal() + " journalLeg1=" + leg1.coreJournal());
+            log.info("Task {} EXECUTED (two-leg): simsem={} leg1={} leg2={} trxRefNo={}",
+                    task.id(), simsemAcct, leg1.coreJournal(), leg2.coreJournal(), trxRefNo);
+            return new ExecutionResult("EXECUTED", null);
+        } catch (RuntimeException e) {
+            throw new PostTransferException(leg2.coreJournal(), e);
+        }
+    }
+
+    /**
+     * The VA tail of TX-B (P3), entered after the shared ceiling re-checks and usage
+     * increments. One - and only one - billing-payment attempt off the frozen task: the
+     * VA number, the amount the maker typed, and the inquiryRequestId the maker's
+     * inquiry answered. The verdict handling is the single-leg core path's: a refusal
+     * rolls TX-B back (usage undone), an unanswered call commits UNKNOWN with usage
+     * kept. On success the legacy record goes to VIRTUAL_ACCOUNT_FT - legacy never wrote
+     * a VA payment to BASE_FT - and the journalNum to TRX_TASK.CORE_JOURNAL (the legacy
+     * VA table has no journal column).
+     */
+    private ExecutionResult virtualAccountWork(ExecutionTaskRow task, String executedBy,
+                                               BigDecimal amount) {
+        TransferOutcome outcome = coreTransferClient.transferVa(
+                new CoreTransferClient.VaInstruction(
+                        task.refNo(), task.remAcctNo(), task.benAcctNo(),
+                        CoreTransferClient.amountString(amount), task.vaInquiryReqId()));
+        if (outcome.status() == CoreTransferClient.Status.REFUSED) {
+            throw new CoreRefusedException(outcome.message());
+        }
+        if (outcome.status() == CoreTransferClient.Status.UNKNOWN) {
+            return fail(task, executedBy, "UNKNOWN", outcome.message());
+        }
+        // SUCCESS - everything below rides on money that has already moved, so a local
+        // failure surfaces as UNKNOWN-with-journal, never as a plain rollback.
+        try {
+            String trxRefNo = TransferServiceImpl.nextRefNo(
+                    transferMapper, task.srvcCd(), task.corpId());
+            BigDecimal fee = nvl(task.feeAmt());
+            transferMapper.insertVirtualAccountFt(new VaFtInsert(
+                    newId(), task.corpId(), task.benAcctNo(),
+                    task.trxCcyCd() != null ? task.trxCcyCd() : "IDR",
+                    amount.add(fee), task.benAcctNm(),
+                    amount, rupiah(amount), fee, rupiah(fee),
+                    task.remAcctNo(), task.refNo(), trxRefNo,
+                    trimTo(task.remark1(), 40),
+                    task.makerUserId(), executedBy));
+            trxTaskMapper.markExecuted(task.id(), outcome.coreJournal(), trxRefNo, executedBy);
+            insertExecuteAction(task, executedBy,
+                    "Pembayaran Virtual Account berhasil. journalNum=" + outcome.coreJournal());
+            log.info("Task {} EXECUTED (virtual account): journalNum={} trxRefNo={}",
+                    task.id(), outcome.coreJournal(), trxRefNo);
+            return new ExecutionResult("EXECUTED", null);
+        } catch (RuntimeException e) {
+            throw new PostTransferException(outcome.coreJournal(), e);
+        }
+    }
+
+    /** The legacy VA table's display figure ("Rp0", "Rp10000") - a label, not a number. */
+    private static String rupiah(BigDecimal amount) {
+        return "Rp" + nvl(amount).stripTrailingZeros().toPlainString();
+    }
+
+    private static String trimTo(String value, int max) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.length() > max ? trimmed.substring(0, max) : trimmed;
+    }
+
+    private static String nonNull(String message) {
+        return message != null ? message : "tanpa pesan.";
+    }
+
+    /** Stores the switch's trace when it answered at all; both-null is a silent no-op. */
+    private void traceInterbank(String taskId, String retrievalRefNo, String responseCode) {
+        if (retrievalRefNo == null && responseCode == null) {
+            return;
+        }
+        trxTaskMapper.updateInterbankResult(taskId, retrievalRefNo, responseCode);
+    }
+
+    /**
+     * The one core attempt, routed by the task's resolved service code (task 1.6): LLG
+     * and RTGS go to direct-integration's kliring/rtgs endpoints, everything else stays
+     * on the P0 in-house call. The instruction is built ENTIRELY from the frozen task
+     * payload plus the corporate's own master data (the sender block - kliring mandates
+     * sender address/phone, so missing CORP data falls back to "-" rather than failing a
+     * released transfer) and config constants (TSA codes, intermediary branch). Nothing
+     * is re-derived from live reference data: what the approver saw is what executes.
+     * All three paths share the same UNKNOWN-on-timeout, never-retried semantics.
+     * {@code fromAccount} is the customer's account on a single-leg transfer and the
+     * simsem account on leg 2 of a two-leg one (P6); the sender block stays the
+     * corporate's either way - the customer is the sender, the simsem account only
+     * holds the money.
+     */
+    private TransferOutcome callCore(ExecutionTaskRow task, BigDecimal amount, String fromAccount) {
+        TransferType type = TransferType.fromServiceCode(task.srvcCd());
+        if (!type.isDomestic()) {
+            return callInHouse(task, amount);
+        }
+        CorpContactRow corp = transferMapper.findCorpContact(task.corpId());
+        String senderName = corp != null && notBlank(corp.nm()) ? corp.nm() : task.corpId();
+        // narrative1 is mandatory upstream; the reference number stands in for a
+        // remark-less instruction.
+        String narrative = notBlank(task.remark1()) ? task.remark1().trim() : task.refNo();
+        if (narrative.length() > 50) {
+            narrative = narrative.substring(0, 50);
+        }
+        String amountStr = CoreTransferClient.amountString(amount);
+        String feeStr = CoreTransferClient.amountString(nvl(task.feeAmt()));
+        if (type == TransferType.LLG) {
+            return coreTransferClient.transferKliring(new CoreTransferClient.KliringInstruction(
+                    fromAccount, amountStr, feeStr,
+                    narrative, null,
+                    task.benAcctNm(),
+                    task.benAddr1(), task.benAddr2(),
+                    task.benPhone(), task.benPostalCd(),
+                    task.benIdNo(), task.benIdType(),
+                    senderName,
+                    corp != null && notBlank(corp.addr1()) ? corp.addr1() : "-",
+                    corp != null && notBlank(corp.phoneNo()) ? corp.phoneNo() : "-",
+                    task.lldIsRemRes(), task.lldIsBenRes(),
+                    task.benBnkCd(),
+                    task.benAcctNo(),
+                    task.benType(),
+                    transferTypeProperties.getIntermediaryBranch(),
+                    task.benBnkBic(),
+                    transferTypeProperties.getLlg().getTsaCode()));
+        }
+        return coreTransferClient.transferRtgs(new CoreTransferClient.RtgsInstruction(
+                fromAccount, amountStr, feeStr,
+                narrative, null, null,
+                task.benAcctNm(),
+                task.benAddr1(), task.benAddr2(),
+                task.benPhone(), task.benPostalCd(),
+                task.benIdNo(), task.benIdType(),
+                senderName, null,
+                task.lldIsRemRes(), task.lldIsBenRes(),
+                task.benBnkCd(),
+                task.benAcctNo(),
+                transferTypeProperties.getIntermediaryBranch(),
+                transferTypeProperties.getRtgs().getTsaCode()));
+    }
+
+    /**
+     * The in-house (Transfer ke BNI) routing per the frozen V7 block (task 5.4): LON
+     * source -> LoanTransfer (each leg carries its own currency/amount, core banking
+     * owns the rate arithmetic); cross deposit source -> DepTransferCross with the
+     * SUBMIT-TIME baseAmount (never re-quoted here - what the approver saw is what
+     * executes); everything else stays on the P0 same-currency call. One attempt each,
+     * UNKNOWN-on-timeout identical.
+     */
+    private TransferOutcome callInHouse(ExecutionTaskRow task, BigDecimal amount) {
+        String creditCcy = task.trxCcyCd();
+        String debitCcy = task.debitCcyCd() != null ? task.debitCcyCd() : creditCcy;
+        BigDecimal debitAmt = task.debitAmt() != null ? task.debitAmt() : amount;
+        if ("LON".equalsIgnoreCase(task.sourceProductType())) {
+            return coreTransferClient.transferLoan(new CoreTransferClient.LoanInstruction(
+                    task.remAcctNo(), debitCcy,
+                    CoreTransferClient.amountString(debitAmt),
+                    task.benAcctNo(), creditCcy,
+                    CoreTransferClient.amountString(amount),
+                    trimNarrative(task.remark1()),
+                    task.rateType()));
+        }
+        if (task.debitCcyCd() != null && !task.debitCcyCd().equals(creditCcy)) {
+            return coreTransferClient.transferCrossCurrency(
+                    new CoreTransferClient.CrossCurrencyInstruction(
+                            task.remAcctNo(),
+                            new CoreTransferClient.Money(
+                                    CoreTransferClient.amountString(debitAmt), debitCcy),
+                            task.benAcctNo(),
+                            new CoreTransferClient.Money(
+                                    CoreTransferClient.amountString(amount), creditCcy),
+                            task.baseAmt() != null
+                                    ? task.baseAmt().stripTrailingZeros().toPlainString()
+                                    : null,
+                            task.rateType(),
+                            trimNarrative(task.remark1()),
+                            null));
+        }
+        return coreTransferClient.transfer(
+                task.remAcctNo(), task.benAcctNo(), amount, creditCcy, task.remark1());
+    }
+
+    /** The 50-char narrative cap the transfer contracts share; null when blank. */
+    private static String trimNarrative(String narrative) {
+        if (narrative == null || narrative.isBlank()) {
+            return null;
+        }
+        String trimmed = narrative.trim();
+        return trimmed.length() > 50 ? trimmed.substring(0, 50) : trimmed;
+    }
+
+    /**
+     * The legacy CLASS discriminator per product. InHouseFT is verified against live
+     * rows; the DEV copy holds NO legacy LLG/RTGS BASE_FT row to verify these two
+     * against (flagged in the P1 roadmap notes), so they follow the in-house naming
+     * pattern - correct here first if a real legacy row ever shows another spelling.
+     */
+    private static String ftClass(TransferType type) {
+        return switch (type) {
+            case LLG -> "com.aprisma.product.gcm.common.model.LLGFT";
+            case RTGS -> "com.aprisma.product.gcm.common.model.RTGSFT";
+            case ONLINE -> "com.aprisma.product.gcm.common.model.OnlineFT";
+            default -> "com.aprisma.product.gcm.common.model.InHouseFT";
+        };
+    }
+
+    private static boolean notBlank(String value) {
+        return value != null && !value.isBlank();
     }
 
     /**
@@ -262,10 +725,34 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         return UUID.randomUUID().toString().replace("-", "");
     }
 
-    /** Core banking definitely said no - thrown to roll TX-B back. */
+    /**
+     * Core banking (or the interbank switch) definitely said no - thrown to roll TX-B
+     * back. The optional trace fields carry the switch's answer on the ONLINE path so
+     * TX-C can persist them after the rollback.
+     */
     private static final class CoreRefusedException extends RuntimeException {
+        final String retrievalRefNo;
+        final String responseCode;
+
         CoreRefusedException(String message) {
+            this(message, null, null);
+        }
+
+        CoreRefusedException(String message, String retrievalRefNo, String responseCode) {
             super(message != null ? message : "tanpa pesan");
+            this.retrievalRefNo = retrievalRefNo;
+            this.responseCode = responseCode;
+        }
+    }
+
+    /**
+     * P6: leg 2 was refused and the refund out of the simsem account landed - thrown to
+     * roll TX-B back (usage undone) so TX-C can write FAILED + REFUND_DONE with the
+     * readable reason carrying both journals.
+     */
+    private static final class TwoLegRefundedException extends RuntimeException {
+        TwoLegRefundedException(String message) {
+            super(message);
         }
     }
 

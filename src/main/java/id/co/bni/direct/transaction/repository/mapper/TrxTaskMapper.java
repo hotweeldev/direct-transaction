@@ -112,4 +112,62 @@ public interface TrxTaskMapper {
      * single-user path, where no release ever happened and the maker stands in.
      */
     String findReleaseActorId(@Param("taskId") String taskId);
+
+    /**
+     * The interbank switch's trace (P2 ONLINE): retrieval reference number + response
+     * code, stored on every outcome where the switch answered at all - EXECUTED, UNKNOWN
+     * (code 68 in-process) and FAILED alike.
+     */
+    int updateInterbankResult(@Param("taskId") String taskId,
+                              @Param("retrievalRefNo") String retrievalRefNo,
+                              @Param("responseCd") String responseCd);
+
+    // ---- P6: two-leg (simsem) execution ----
+
+    /**
+     * Pins the simsem account chosen for this task before leg 1 is sent, so a leg-1
+     * timeout still leaves a record of which holding account may hold the money.
+     * TWO_LEG_STATE is not touched. Guarded on EXECUTING.
+     */
+    int markSimsemSelected(@Param("taskId") String taskId,
+                           @Param("simsemAcctNo") String simsemAcctNo,
+                           @Param("updatedBy") String updatedBy);
+
+    /**
+     * Leg 1 confirmed: records the chosen simsem account and leg 1's journal and moves
+     * TWO_LEG_STATE to LEG1_DONE, keeping the task EXECUTING (leg 2 has not run). Guarded
+     * on EXECUTING so only the claim holder can advance it.
+     */
+    int markLeg1Done(@Param("taskId") String taskId,
+                     @Param("simsemAcctNo") String simsemAcctNo,
+                     @Param("journalNoSimsem") String journalNoSimsem,
+                     @Param("updatedBy") String updatedBy);
+
+    /** Set TWO_LEG_STATE alone (LEG2_DONE / REFUND_DONE / REFUND_FAILED) - no status change. */
+    int updateTwoLegState(@Param("taskId") String taskId,
+                          @Param("twoLegState") String twoLegState,
+                          @Param("updatedBy") String updatedBy);
+
+    /** The two-leg state a reconciliation reads; null when the task does not exist. */
+    TrxTaskRows.TwoLegState findTwoLegState(@Param("taskId") String taskId);
+
+    /**
+     * Reconciliation found leg 2 DID land: finalize EXECUTED with leg 2's journal and
+     * TWO_LEG_STATE LEG2_DONE. Guarded on the exact pre-state (UNKNOWN + LEG1_DONE) so a
+     * concurrent reconcile or a re-post is a no-op (0 rows).
+     */
+    int reconcileToExecuted(@Param("taskId") String taskId,
+                            @Param("coreJournal") String coreJournal,
+                            @Param("trxRefNo") String trxRefNo,
+                            @Param("updatedBy") String updatedBy);
+
+    /**
+     * Reconciliation found leg 2 did NOT land and the refund ran: land the task on its
+     * terminal status ({@code FAILED} with REFUND_DONE, or {@code UNKNOWN} with
+     * REFUND_FAILED) from the UNKNOWN + LEG1_DONE pre-state. Same 0-rows idempotency.
+     */
+    int reconcileToRefunded(@Param("taskId") String taskId,
+                            @Param("status") String status,
+                            @Param("twoLegState") String twoLegState,
+                            @Param("updatedBy") String updatedBy);
 }

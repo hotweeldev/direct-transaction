@@ -29,4 +29,12 @@ public final class TaskRequests {
             @NotBlank String note,
             @NotNull @Valid OtpRequest otp) {
     }
+
+    /**
+     * P6 reconciliation of a two-leg task left UNKNOWN. No OTP: nothing new is
+     * authorized - the instruction was approved and released already; this only
+     * establishes what core banking did with it.
+     */
+    public record ReconcileTaskRequest(@NotBlank String userId) {
+    }
 }

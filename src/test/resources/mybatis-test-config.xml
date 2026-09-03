@@ -31,6 +31,7 @@
     <mappers>
         <mapper resource="mapper/TransferMapper.xml"/>
         <mapper resource="mapper/TrxTaskMapper.xml"/>
+        <mapper resource="mapper/SimsemMapper.xml"/>
         <mapper resource="mapper/ExecutionOutboxMapper.xml"/>
         <mapper resource="mapper/ActivityMapper.xml"/>
     </mappers>

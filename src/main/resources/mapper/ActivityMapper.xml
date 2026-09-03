@@ -9,7 +9,8 @@
              legacy never wrote a pending or refused transaction to BASE_FT.
     LEGACY - BASE_FT, the legacy final record. Rows the rewrite executed are ALSO in BASE_FT,
              so they are excluded here by REF_NO and served from TRX_TASK, which carries the
-             approval trail.
+             approval trail. P3 adds VIRTUAL_ACCOUNT_FT under the same LEGACY label: legacy
+             booked VA payments there, never in BASE_FT.
 
   Scope (decision 2026-09-01): per company, and only accounts the user holds INQUIRY rights
   on through the legacy chain CORP_USR -> CORP_USR_GRP -> CORP_ACCT_GRP_DTL (IS_INQ) ->
@@ -90,6 +91,37 @@
         LEFT JOIN CORP_USR mk ON mk.ID = f.CREATED_BY
         WHERE f.REM_ACCT_NO IN (SELECT ca2.ACCT_NO FROM CORP_ACCT ca2 WHERE ca2.CORP_ID = #{f.companyId})
           AND NOT EXISTS (SELECT 1 FROM TRX_TASK x WHERE x.CORP_ID = #{f.companyId} AND x.REF_NO = f.REF_NO)
+        UNION ALL
+        <!-- P3: legacy VA payments live in VIRTUAL_ACCOUNT_FT, never in BASE_FT. The table
+             carries no menu/service/journal columns: menu and service are the constants
+             every VA payment books under, the journal is unknown (legacy kept it off this
+             table). Rows the rewrite executed are excluded by REF_NO like BASE_FT. -->
+        SELECT N'LEGACY',
+               CAST(NULL AS NVARCHAR2(40)),
+               v.REF_NO,
+               v.TRX_REF_NO,
+               N'MNU_GCME_050200',
+               N'GCM_VA_BILLING',
+               CASE WHEN v.PROCESS_FLAG = N'Y' THEN N'EXECUTED' ELSE N'PENDING' END,
+               CASE WHEN v.PROCESS_FLAG = N'Y' THEN N'BERHASIL' ELSE N'DIPROSES' END,
+               v.BILLED_AMOUNT,
+               v.CURRENCY,
+               v.DEBITED_ACC_NO,
+               v.VA_NO,
+               v.VA_NAME,
+               v.REMARK,
+               N'1',
+               v.INSTRUCTION_DT,
+               v.CREATED_DT,
+               CASE WHEN v.PROCESS_FLAG = N'Y' THEN NVL(v.UPDATED_DT, v.CREATED_DT) END,
+               CAST(NULL AS NVARCHAR2(40)),
+               vmk.USER_ID,
+               CAST(NULL AS NVARCHAR2(40)),
+               CAST(NULL AS NVARCHAR2(40))
+        FROM VIRTUAL_ACCOUNT_FT v
+        LEFT JOIN CORP_USR vmk ON vmk.ID = v.CREATED_BY
+        WHERE v.CORP_ID = #{f.companyId}
+          AND NOT EXISTS (SELECT 1 FROM TRX_TASK x WHERE x.CORP_ID = #{f.companyId} AND x.REF_NO = v.REF_NO)
     </sql>
 
     <sql id="activityWhere">

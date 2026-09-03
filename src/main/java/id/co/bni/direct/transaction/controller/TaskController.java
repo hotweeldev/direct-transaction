@@ -1,12 +1,15 @@
 package id.co.bni.direct.transaction.controller;
 
 import id.co.bni.direct.transaction.dto.request.TaskRequests.ApproveTaskRequest;
+import id.co.bni.direct.transaction.dto.request.TaskRequests.ReconcileTaskRequest;
 import id.co.bni.direct.transaction.dto.request.TaskRequests.RejectTaskRequest;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.InboxResponse;
+import id.co.bni.direct.transaction.dto.response.TaskResponses.ReconcileResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.TaskActionResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.TaskDetailResponse;
 import id.co.bni.direct.transaction.security.RequiresPermission;
 import id.co.bni.direct.transaction.security.TokenIdentity;
+import id.co.bni.direct.transaction.service.ReconciliationService;
 import id.co.bni.direct.transaction.service.TaskApprovalService;
 import id.co.bni.direct.transaction.service.TransferService;
 import jakarta.servlet.http.HttpServletRequest;
@@ -42,11 +45,14 @@ public class TaskController {
 
     private final TaskApprovalService taskApprovalService;
     private final TransferService transferService;
+    private final ReconciliationService reconciliationService;
 
     public TaskController(TaskApprovalService taskApprovalService,
-                          TransferService transferService) {
+                          TransferService transferService,
+                          ReconciliationService reconciliationService) {
         this.taskApprovalService = taskApprovalService;
         this.transferService = transferService;
+        this.reconciliationService = reconciliationService;
     }
 
     /**
@@ -84,6 +90,23 @@ public class TaskController {
             HttpServletRequest servletRequest) {
         TokenIdentity.requireSameUser(servletRequest, request.userId());
         return ResponseEntity.ok(taskApprovalService.approve(companyId, actor, taskId, request));
+    }
+
+    /**
+     * P6: reconcile a two-leg (simsem) task left UNKNOWN after leg 1 was confirmed - ask
+     * core banking whether leg 2 left the simsem account, then finalize EXECUTED, refund,
+     * or answer "inconclusive". Idempotent; a task in any other state is a 422
+     * {@code TASK_NOT_RECONCILABLE}. Same guard stack as approve/reject.
+     */
+    @PostMapping("/{taskId}/reconcile")
+    public ResponseEntity<ReconcileResponse> reconcile(
+            @PathVariable String companyId,
+            @PathVariable String taskId,
+            @Valid @RequestBody ReconcileTaskRequest request,
+            @RequestHeader(value = "X-User-Id", defaultValue = "system") String actor,
+            HttpServletRequest servletRequest) {
+        TokenIdentity.requireSameUser(servletRequest, request.userId());
+        return ResponseEntity.ok(reconciliationService.reconcile(companyId, taskId, actor));
     }
 
     /** Reject the task outright; the note saying why is required. */

@@ -50,10 +50,11 @@ class ExecutionEventConsumerTest {
 
     private static TaskRow task(String status, String coreJournal) {
         return new TaskRow("T1", "20260831100000228541", "MNU_GCME_050200",
-                status, null, new BigDecimal("10000000"), "IDR",
+                "GCM_FTR_IH_3RD", status, null, new BigDecimal("10000000"), "IDR",
                 "113179933", "1000533372", "PT MAJU JAYA", "pembayaran vendor",
                 "BUDI SANTOSO", LocalDateTime.of(2026, 8, 31, 10, 0), 5L,
-                coreJournal, "00000000000000000042", LocalDateTime.of(2026, 8, 31, 10, 5));
+                coreJournal, "00000000000000000042", LocalDateTime.of(2026, 8, 31, 10, 5),
+                null, null, null, null, null, null, null);
     }
 
     @Test

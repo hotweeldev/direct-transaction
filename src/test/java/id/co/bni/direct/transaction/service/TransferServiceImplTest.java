@@ -6,8 +6,10 @@ import java.util.List;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.MoneyRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.OtpRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.SubmitTransferRequest;
+import id.co.bni.direct.transaction.config.TransferTypeProperties;
 import id.co.bni.direct.transaction.entity.TransferRows.BankLimitRow;
 import id.co.bni.direct.transaction.entity.TransferRows.CorpFlagsRow;
+import id.co.bni.direct.transaction.entity.TransferRows.DomBankRow;
 import id.co.bni.direct.transaction.entity.TransferRows.MakerRow;
 import id.co.bni.direct.transaction.entity.TransferRows.MatrixBandRow;
 import id.co.bni.direct.transaction.entity.TransferRows.MatrixSignatureRow;
@@ -15,13 +17,17 @@ import id.co.bni.direct.transaction.entity.TransferRows.UsageLimitRow;
 import id.co.bni.direct.transaction.entity.TransferRows.WorkflowUserRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows;
 import id.co.bni.direct.transaction.exception.BusinessRuleException;
+import id.co.bni.direct.transaction.exception.ServiceUnavailableException;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.InterbankInquiryRequest;
 import id.co.bni.direct.transaction.integration.AccountNameClient;
+import id.co.bni.direct.transaction.integration.CoreTransferClient;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient.Verification;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
 import id.co.bni.direct.transaction.service.impl.ExecutionOutbox;
 import id.co.bni.direct.transaction.service.impl.TransferServiceImpl;
+import id.co.bni.direct.transaction.service.TransferType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -36,6 +42,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.VaInquiryRequest;
+import id.co.bni.direct.transaction.exception.NotFoundException;
 
 /**
  * Mock the mappers and both clients, drive the submit pipeline, assert on the wire shape
@@ -53,6 +61,7 @@ class TransferServiceImplTest {
     private UmasAuthenticatorClient authenticatorClient;
     private ExecutionService executionService;
     private ExecutionOutbox executionOutbox;
+    private CoreTransferClient coreTransferClient;
     private TransferServiceImpl service;
 
     @BeforeEach
@@ -64,9 +73,11 @@ class TransferServiceImplTest {
         executionService = mock(ExecutionService.class);
         // Mockito default: isKafkaMode() answers false = sync mode, today's behavior.
         executionOutbox = mock(ExecutionOutbox.class);
+        coreTransferClient = mock(CoreTransferClient.class);
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
-                accountNameClient, authenticatorClient, executionService,
-                executionOutbox, mock(PlatformTransactionManager.class));
+                accountNameClient, coreTransferClient, authenticatorClient,
+                executionService, executionOutbox, new TransferTypeProperties(),
+                mock(PlatformTransactionManager.class));
     }
 
     private static WorkflowUserRow user(String corpUserId, String login, String name,
@@ -471,10 +482,12 @@ class TransferServiceImplTest {
     void detailGroupsActionsUnderTheirStagesAndNamesTheMenu() {
         var created = java.time.LocalDateTime.of(2026, 8, 31, 10, 0);
         when(trxTaskMapper.findTask(COMPANY, "T1")).thenReturn(new TrxTaskRows.TaskRow(
-                "T1", "20260831100000228541", TransferServiceImpl.MENU_CD, "PENDING_RELEASE",
+                "T1", "20260831100000228541", TransferServiceImpl.MENU_CD,
+                TransferServiceImpl.SRVC_IN_HOUSE_3RD, "PENDING_RELEASE",
                 2, new BigDecimal("10000000"), "IDR", SOURCE, BENEFICIARY, "PT MAJU JAYA",
                 "pembayaran vendor", "BUDI SANTOSO", created, 1L,
-                "907409", "20260831110000000042", created.plusHours(2)));
+                "907409", "20260831110000000042", created.plusHours(2),
+                null, null, null, null, null, null, null));
         when(trxTaskMapper.findStages("T1")).thenReturn(List.of(
                 new TrxTaskRows.StageRow(1, "APPROVAL", "AL02", "2", 1, 1, "DONE"),
                 new TrxTaskRows.StageRow(2, "RELEASE", null, "1", 1, 0, "ACTIVE")));
@@ -496,5 +509,907 @@ class TransferServiceImplTest {
         assertThat(detail.stages().get(0).actions().get(0).action()).isEqualTo("APPROVE");
         // The SUBMIT action belongs to no stage and must not leak into one.
         assertThat(detail.stages().get(1).actions()).isEmpty();
+    }
+
+    // ---- P1: LLG/RTGS submit (type routing, bank shape, fee-inclusive ladder) ----
+
+    /** A domestic submit: the full-argument wire shape with the P1 fields set. */
+    private static SubmitTransferRequest domesticRequest(String type, String amount, String postal) {
+        return new SubmitTransferRequest("budi", SOURCE, "3049530495", "YOSUA PRISKWILA",
+                new MoneyRequest(new BigDecimal(amount), "IDR"), "bayar vendor",
+                new OtpRequest("CH-1", "123456"),
+                type, "DB1", "Jl. Melati 1", null, null, "0811", postal,
+                null, null, null, null, null);
+    }
+
+    private void stubDomestic() {
+        stubHappyPath();
+        when(transferMapper.findDomBank("DB1"))
+                .thenReturn(new DomBankRow("DB1", "0140397", "BANK BCA", "CENAIDJA", "014"));
+        when(transferMapper.findMatrixMasterId(COMPANY,
+                TransferServiceImpl.MENU_CD_BANK_LAIN, "IDR")).thenReturn("MSTR1");
+    }
+
+    @Test
+    void llgSubmitResolvesTheDomesticServiceMenuAndFee() {
+        stubDomestic();
+
+        var response = service.submit(COMPANY, "budi", domesticRequest("LLG", "10000000", null));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().menuCd()).isEqualTo(TransferServiceImpl.MENU_CD_BANK_LAIN);
+        assertThat(task.getValue().srvcCd()).isEqualTo(TransferType.SRVC_DOM_LLG);
+        var dom = task.getValue().domestic();
+        assertThat(dom.benDomBnkId()).isEqualTo("DB1");
+        assertThat(dom.benBnkCd()).isEqualTo("0140397");
+        assertThat(dom.benBnkBic()).isEqualTo("CENAIDJA");
+        assertThat(dom.benType()).isEqualTo("1");
+        assertThat(dom.lldIsRemRes()).isEqualTo("1");
+        assertThat(dom.lldIsBenRes()).isEqualTo("1");
+        assertThat(dom.feeAmt()).isEqualByComparingTo("2900");
+        // The ladder keys on the DOM service code (task 1.5), and the beneficiary
+        // own/3rd probe never runs for a domestic transfer.
+        verify(transferMapper).findBankLimit(TransferType.SRVC_DOM_LLG, "IDR");
+        verify(transferMapper, never()).countAnyAccount(anyString(), anyString());
+    }
+
+    @Test
+    void rtgsSubmitUsesTheBicAndItsOwnResidencyDefaults() {
+        stubDomestic();
+
+        service.submit(COMPANY, "budi", domesticRequest("RTGS", "10000000", "12345"));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().srvcCd()).isEqualTo(TransferType.SRVC_DOM_RTGS);
+        var dom = task.getValue().domestic();
+        // RTGS routes by BIC, carries no beneficiary type, and speaks its own residency
+        // vocabulary (0 = Resident).
+        assertThat(dom.benBnkCd()).isEqualTo("CENAIDJA");
+        assertThat(dom.benType()).isNull();
+        assertThat(dom.lldIsRemRes()).isEqualTo("0");
+        assertThat(dom.lldIsBenRes()).isEqualTo("0");
+        assertThat(dom.feeAmt()).isEqualByComparingTo("30000");
+        verify(transferMapper).findBankLimit(TransferType.SRVC_DOM_RTGS, "IDR");
+    }
+
+    @Test
+    void theDomesticLadderValidatesAmountPlusFee() {
+        stubDomestic();
+        // Room for the amount alone but NOT for amount + the 2,900 LLG fee.
+        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
+                .thenReturn(new UsageLimitRow(BigDecimal.ZERO, new BigDecimal("10000000")));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticRequest("LLG", "10000000", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("COMPANY_LIMIT"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void llgRejectsABankRowWithoutAClearingCode() {
+        stubDomestic();
+        // A BIC-keyed COM_MT_DOM_BANK row (no 7-digit sandi) cannot be routed via LLG.
+        when(transferMapper.findDomBank("DB1"))
+                .thenReturn(new DomBankRow("DB1", "CENAIDJA", "BANK BCA", "CENAIDJA", null));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticRequest("LLG", "10000000", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("BENEFICIARY_BANK_INVALID"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void rtgsWithoutAPostalCodeIsRejected() {
+        stubDomestic();
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticRequest("RTGS", "10000000", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+    }
+
+    @Test
+    void anUnknownTransferTypeIsRejected() {
+        stubHappyPath();
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticRequest("SWIFT", "10000000", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+    }
+
+    @Test
+    void theBankPickerAnswersRoutableCodesPerMethod() {
+        when(transferMapper.findClearingBanks()).thenReturn(List.of(
+                new DomBankRow("DB1", "0140397", "BANK BCA", "CENAIDJAXXX", "014")));
+        when(transferMapper.findRtgsBanks()).thenReturn(List.of(
+                new DomBankRow("DB2", "PINBIDJA", "BANK PANIN", null, null)));
+
+        var llg = service.banks(COMPANY, "LLG");
+        assertThat(llg).hasSize(1);
+        assertThat(llg.get(0).code()).isEqualTo("0140397");
+        // An 11-char branch-qualified BIC is trimmed to the 8 chars kliring mandates.
+        assertThat(llg.get(0).bic()).isEqualTo("CENAIDJA");
+
+        var rtgs = service.banks(COMPANY, "RTGS");
+        assertThat(rtgs).hasSize(1);
+        assertThat(rtgs.get(0).code()).isEqualTo("PINBIDJA");
+        assertThat(rtgs.get(0).bic()).isEqualTo("PINBIDJA");
+    }
+
+    @Test
+    void methodInfoAnswersTheDevSysParamValues() {
+        // The two real DEV SYS_PARAM rows, verbatim.
+        when(transferMapper.findSysParamValue("SYS_PARAM_TRF_SME_LLG"))
+                .thenReturn("2 - 3 hari|IDR 1|IDR 10,000,000,000,00|IDR 2,900");
+        when(transferMapper.findSysParamValue("SYS_PARAM_TRF_SME_RTGS"))
+                .thenReturn("3 - 4 jam|IDR 1,000,000,000|IDR 10,000,000,000,00|IDR 30,000");
+
+        var llg = service.methodInfo(COMPANY, "LLG");
+        assertThat(llg.method()).isEqualTo("LLG");
+        assertThat(llg.currency()).isEqualTo("IDR");
+        assertThat(llg.minAmount()).isEqualByComparingTo("1");
+        assertThat(llg.maxAmount()).isEqualByComparingTo("10000000000");
+        assertThat(llg.fee()).isEqualByComparingTo("2900");
+        assertThat(llg.estimatedDuration()).isEqualTo("2 - 3 hari");
+
+        var rtgs = service.methodInfo(COMPANY, "RTGS");
+        assertThat(rtgs.method()).isEqualTo("RTGS");
+        assertThat(rtgs.currency()).isEqualTo("IDR");
+        assertThat(rtgs.minAmount()).isEqualByComparingTo("1000000000");
+        assertThat(rtgs.maxAmount()).isEqualByComparingTo("10000000000");
+        assertThat(rtgs.fee()).isEqualByComparingTo("30000");
+        assertThat(rtgs.estimatedDuration()).isEqualTo("3 - 4 jam");
+    }
+
+    @Test
+    void methodInfoFallsBackToTheConfiguredFeeWhenTheParamIsMissing() {
+        // The mapper answers null (row missing or IS_DELETE='Y'): everything is null
+        // except the fee, which falls back to app.transfer.*.fee so the FE always has one.
+        var rtgs = service.methodInfo(COMPANY, "RTGS");
+        assertThat(rtgs.minAmount()).isNull();
+        assertThat(rtgs.maxAmount()).isNull();
+        assertThat(rtgs.estimatedDuration()).isNull();
+        assertThat(rtgs.fee()).isEqualByComparingTo("30000");
+
+        var llg = service.methodInfo(COMPANY, "LLG");
+        assertThat(llg.fee()).isEqualByComparingTo("2900");
+
+        var online = service.methodInfo(COMPANY, "ONLINE");
+        assertThat(online.fee()).isEqualByComparingTo("6500");
+    }
+
+    @Test
+    void methodInfoRejectsANonDomesticMethod() {
+        for (String bad : new String[]{"BNI", "SWIFT"}) {
+            assertThatThrownBy(() -> service.methodInfo(COMPANY, bad))
+                    .isInstanceOf(BusinessRuleException.class)
+                    .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                            .isEqualTo("TRANSFER_FIELDS_INVALID"));
+        }
+    }
+
+    // ---- P2: ONLINE (RTOL / ATM Bersama) ----
+
+    @Test
+    void onlineSubmitResolvesTheOnlineServiceAndIgnoresTheAddressBlock() {
+        stubDomestic();
+
+        var response = service.submit(COMPANY, "budi", domesticRequest("ONLINE", "10000000", "12345"));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().menuCd()).isEqualTo(TransferServiceImpl.MENU_CD_BANK_LAIN);
+        assertThat(task.getValue().srvcCd()).isEqualTo(TransferType.SRVC_DOM_ONLINE);
+        var dom = task.getValue().domestic();
+        assertThat(dom.benDomBnkId()).isEqualTo("DB1");
+        // The bank code is the 3-digit interbank/ATM-Bersama code, never sandi or BIC.
+        assertThat(dom.benBnkCd()).isEqualTo("014");
+        assertThat(dom.benBnkNm()).isEqualTo("BANK BCA");
+        assertThat(dom.benBnkBic()).isNull();
+        // The interbank wire carries no address/postal/residency/type fields: values
+        // the FE sent are accepted and ignored, not frozen onto the task.
+        assertThat(dom.benAddr1()).isNull();
+        assertThat(dom.benPostalCd()).isNull();
+        assertThat(dom.benType()).isNull();
+        assertThat(dom.lldIsRemRes()).isNull();
+        assertThat(dom.lldIsBenRes()).isNull();
+        assertThat(dom.feeAmt()).isEqualByComparingTo("6500");
+        // The ladder keys on the ONLINE service code; no own/3rd probe for domestic.
+        verify(transferMapper).findBankLimit(TransferType.SRVC_DOM_ONLINE, "IDR");
+        verify(transferMapper, never()).countAnyAccount(anyString(), anyString());
+    }
+
+    @Test
+    void onlineRejectsABankRowWithoutAnOnlineCode() {
+        stubDomestic();
+        when(transferMapper.findDomBank("DB1"))
+                .thenReturn(new DomBankRow("DB1", "0140397", "BANK BCA", "CENAIDJA", null));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticRequest("ONLINE", "10000000", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("BENEFICIARY_BANK_INVALID"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void theOnlineLadderValidatesAmountPlusFee() {
+        stubDomestic();
+        // Room for the amount alone but NOT for amount + the 6,500 ONLINE fee.
+        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
+                .thenReturn(new UsageLimitRow(BigDecimal.ZERO, new BigDecimal("10000000")));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticRequest("ONLINE", "10000000", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("COMPANY_LIMIT"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void theOnlineBankPickerAnswersTheInterbankCode() {
+        when(transferMapper.findOnlineBanks()).thenReturn(List.of(
+                new DomBankRow("DB3", "0140397", "BANK BCA", "CENAIDJA2", "014")));
+
+        var online = service.banks(COMPANY, "ONLINE");
+
+        assertThat(online).hasSize(1);
+        assertThat(online.get(0).id()).isEqualTo("DB3");
+        assertThat(online.get(0).code()).isEqualTo("014");
+        assertThat(online.get(0).bic()).isNull();
+    }
+
+    @Test
+    void methodInfoParsesTheDevOnlineRowWithItsProseToken() {
+        when(transferMapper.findSysParamValue("SYS_PARAM_TRF_SME_ONLINE"))
+                .thenReturn("Real Time|IDR 20,000|IDR 1000,000,000 per transaksi, sehari 1 M|IDR 6,500");
+
+        var online = service.methodInfo(COMPANY, "ONLINE");
+
+        assertThat(online.method()).isEqualTo("ONLINE");
+        assertThat(online.currency()).isEqualTo("IDR");
+        assertThat(online.minAmount()).isEqualByComparingTo("20000");
+        assertThat(online.maxAmount()).isEqualByComparingTo("1000000000");
+        assertThat(online.fee()).isEqualByComparingTo("6500");
+        assertThat(online.estimatedDuration()).isEqualTo("Real Time");
+    }
+
+    @Test
+    void interbankInquiryRoutesTheOnlineCodeAndAnswersTheBeneficiary() {
+        when(transferMapper.findDomBank("DB1"))
+                .thenReturn(new DomBankRow("DB1", "0140397", "BANK BCA", "CENAIDJA", "014"));
+        when(coreTransferClient.inquireInterbank(any())).thenReturn(
+                new CoreTransferClient.InterbankInquiry("YOSUA PRISKWILA", "BANK CENTRAL ASIA",
+                        "3049530495", "RRN0001", "PT DEMO"));
+
+        var response = service.interbankInquiry(COMPANY, new InterbankInquiryRequest(
+                "budi", SOURCE, "3049530495", "DB1", new BigDecimal("250000")));
+
+        assertThat(response.beneficiaryName()).isEqualTo("YOSUA PRISKWILA");
+        assertThat(response.beneficiaryBankName()).isEqualTo("BANK CENTRAL ASIA");
+        assertThat(response.retrievalRefNo()).isEqualTo("RRN0001");
+        ArgumentCaptor<CoreTransferClient.InterbankInstruction> instruction =
+                ArgumentCaptor.forClass(CoreTransferClient.InterbankInstruction.class);
+        verify(coreTransferClient).inquireInterbank(instruction.capture());
+        assertThat(instruction.getValue().fromAccount()).isEqualTo(SOURCE);
+        assertThat(instruction.getValue().beneficiaryAccount()).isEqualTo("3049530495");
+        assertThat(instruction.getValue().beneficiaryBankCode()).isEqualTo("014");
+        assertThat(instruction.getValue().amount()).isEqualTo("250000.00");
+        // References ride in the TRX_REF_NO shape but never touch the shared counter.
+        assertThat(instruction.getValue().refNo()).matches("\\d{20}");
+        assertThat(instruction.getValue().customerRefNo()).matches("\\d{20}");
+        verify(transferMapper, never()).lockRefNoValue(anyString(), anyString());
+    }
+
+    @Test
+    void interbankInquiryRejectsABankThatCannotBeRoutedOnline() {
+        when(transferMapper.findDomBank("DB1"))
+                .thenReturn(new DomBankRow("DB1", "0140397", "BANK BCA", "CENAIDJA", null));
+
+        assertThatThrownBy(() -> service.interbankInquiry(COMPANY, new InterbankInquiryRequest(
+                "budi", SOURCE, "3049530495", "DB1", new BigDecimal("250000"))))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("BENEFICIARY_BANK_INVALID"));
+    }
+
+    // ---- P5: multi-currency (cross, loan source, trxPBI gate, decimal rules) ----
+
+    /** A P5 multi-currency submit: the BNI wire plus the additive currency fields. */
+    private static SubmitTransferRequest crossRequest(String amount, String creditCcy,
+                                                      String debitAmount, String rateType,
+                                                      String docType, String docNumber) {
+        return new SubmitTransferRequest("budi", SOURCE, BENEFICIARY, "PT MAJU JAYA",
+                new MoneyRequest(new BigDecimal(amount), creditCcy), "pembayaran vendor",
+                new OtpRequest("CH-1", "123456"),
+                null, null, null, null, null, null, null, null, null, null, null, null,
+                creditCcy, debitAmount != null ? new BigDecimal(debitAmount) : null,
+                rateType, docType, docNumber, null, null, null);
+    }
+
+    private void stubShortDetails(String ccy, String productType) {
+        when(accountNameClient.fetchShortDetails(SOURCE)).thenReturn(
+                new AccountNameClient.ShortDetails(SOURCE, "PT DEMO", ccy, "BUKA", productType));
+    }
+
+    @Test
+    void usdToIdrTakesBaseAmountFromTheIdrCreditLegWithoutARateCall() {
+        stubHappyPath();
+        stubShortDetails("USD", "DEP");
+
+        var response = service.submit(COMPANY, "budi",
+                crossRequest("165000000", "IDR", "10000", null, null, null));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        var cross = task.getValue().cross();
+        assertThat(cross.debitCcyCd()).isEqualTo("USD");
+        assertThat(cross.debitAmt()).isEqualByComparingTo("10000");
+        assertThat(cross.baseAmt()).isEqualByComparingTo("165000000");
+        assertThat(cross.exchangeRate()).isNull();
+        assertThat(cross.rateType()).isEqualTo("02");
+        assertThat(cross.sourceProductType()).isEqualTo("DEP");
+        // The ladder guards the DEBIT side, in the debit currency; no rate, no gate.
+        verify(transferMapper).findBankLimit(TransferServiceImpl.SRVC_IN_HOUSE_3RD, "USD");
+        verify(coreTransferClient, never()).fetchRates(anyString());
+        verify(coreTransferClient, never()).checkUnderlying(any());
+    }
+
+    @Test
+    void idrDebitLegMakesTheDebitAmountTheBaseAmount() {
+        stubHappyPath();
+        stubShortDetails("IDR", "DEP");
+        when(transferMapper.findCorpHostCif(COMPANY)).thenReturn("9000055012");
+        when(coreTransferClient.checkUnderlying(any())).thenReturn(
+                new CoreTransferClient.UnderlyingCheck(null, false, false));
+
+        service.submit(COMPANY, "budi",
+                crossRequest("10000", "USD", "165000000", null, null, null));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        var cross = task.getValue().cross();
+        assertThat(cross.debitCcyCd()).isEqualTo("IDR");
+        assertThat(cross.baseAmt()).isEqualByComparingTo("165000000");
+        assertThat(cross.exchangeRate()).isNull();
+        verify(coreTransferClient, never()).fetchRates(anyString());
+    }
+
+    @Test
+    void valasToValasBuysTheDebitCurrencysRateAndRoundsBaseAmountToIdr() {
+        stubHappyPath();
+        stubShortDetails("USD", "DEP");
+        when(coreTransferClient.fetchRates("02")).thenReturn(List.of(
+                new CoreTransferClient.Rate("USD", "IDR", "01", null, "16500.55", "16600")));
+
+        service.submit(COMPANY, "budi",
+                crossRequest("2000", "SGD", "123.45", null, null, null));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        var cross = task.getValue().cross();
+        assertThat(cross.exchangeRate()).isEqualByComparingTo("16500.55");
+        // 123.45 x 16500.55 = 2 036 992.899 75 -> IDR is a whole number: 2 036 993.
+        assertThat(cross.baseAmt()).isEqualByComparingTo("2036993");
+        verify(coreTransferClient, never()).checkUnderlying(any());
+    }
+
+    @Test
+    void aPerHundredQuotedRateIsScaledByItsUnits() {
+        stubHappyPath();
+        stubShortDetails("JPY", "DEP");
+        when(coreTransferClient.fetchRates("02")).thenReturn(List.of(
+                new CoreTransferClient.Rate("JPY", "IDR", "100", null, "10940", "11000")));
+
+        service.submit(COMPANY, "budi",
+                crossRequest("50", "USD", "10000", null, null, null));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().cross().exchangeRate()).isEqualByComparingTo("109.4");
+        assertThat(task.getValue().cross().baseAmt()).isEqualByComparingTo("1094000");
+    }
+
+    private void stubGateCorridor() {
+        stubHappyPath();
+        stubShortDetails("IDR", "DEP");
+        when(transferMapper.findCorpHostCif(COMPANY)).thenReturn("9000055012");
+    }
+
+    @Test
+    void idrToValasWithUnderlyingRequiredAndNoDocumentIs422UnderlyingRequired() {
+        stubGateCorridor();
+        when(coreTransferClient.checkUnderlying(any())).thenReturn(
+                new CoreTransferClient.UnderlyingCheck(
+                        "Nasabah WAJIB menyerahkan dokumen underlying.", false, true));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                crossRequest("10000", "USD", "165000000", null, null, null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> {
+                    assertThat(((BusinessRuleException) e).code()).isEqualTo("UNDERLYING_REQUIRED");
+                    assertThat(e.getMessage()).contains("WAJIB menyerahkan dokumen");
+                });
+        verify(trxTaskMapper, never()).insertTask(any());
+
+        // The check instruction speaks the corridor: the customer sells IDR, buys USD.
+        ArgumentCaptor<CoreTransferClient.UnderlyingCheckInstruction> check =
+                ArgumentCaptor.forClass(CoreTransferClient.UnderlyingCheckInstruction.class);
+        verify(coreTransferClient).checkUnderlying(check.capture());
+        assertThat(check.getValue().cif()).isEqualTo("9000055012");
+        assertThat(check.getValue().sellCurrency()).isEqualTo("IDR");
+        assertThat(check.getValue().buyCurrency()).isEqualTo("USD");
+        assertThat(check.getValue().amount()).isEqualTo("10000.00");
+    }
+
+    @Test
+    void underlyingRequiredWithADeclaredDocumentPassesAndFreezesTheDocument() {
+        stubGateCorridor();
+        when(coreTransferClient.checkUnderlying(any())).thenReturn(
+                new CoreTransferClient.UnderlyingCheck("wajib underlying", false, true));
+
+        var response = service.submit(COMPANY, "budi",
+                crossRequest("10000", "USD", "165000000", null, "INV", "INV-2026-001"));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().cross().undDocType()).isEqualTo("INV");
+        assertThat(task.getValue().cross().undDocNo()).isEqualTo("INV-2026-001");
+    }
+
+    @Test
+    void statementRequiredNeverBlocksAndRidesAsTheAdvisory() {
+        stubGateCorridor();
+        when(coreTransferClient.checkUnderlying(any())).thenReturn(
+                new CoreTransferClient.UnderlyingCheck(
+                        "Nasabah WAJIB melengkapi surat pernyataan (eqv USD 10.000)", true, false));
+
+        var response = service.submit(COMPANY, "budi",
+                crossRequest("10000", "USD", "165000000", null, null, null));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        assertThat(response.advisoryMessage()).contains("surat pernyataan");
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().cross().advisoryMsg()).contains("surat pernyataan");
+    }
+
+    @Test
+    void anUnreachableUnderlyingCheckFailsClosedWithA503() {
+        stubGateCorridor();
+        when(coreTransferClient.checkUnderlying(any())).thenThrow(
+                new ServiceUnavailableException(
+                        "Pemeriksaan underlying Bank Indonesia sedang tidak tersedia."));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                crossRequest("10000", "USD", "165000000", null, null, null)))
+                .isInstanceOf(ServiceUnavailableException.class);
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void anIdrAmountWithDecimalsIsRejectedBeforeAnyProbe() {
+        stubHappyPath();
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi", request("10000000.55")))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+        verify(accountNameClient, never()).fetchShortDetails(anyString());
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aDebitAmountBreakingTheDebitCurrencysDecimalRuleIsRejected() {
+        stubHappyPath();
+        stubShortDetails("JPY", "DEP");
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                crossRequest("50", "USD", "10000.5", null, null, null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aCrossSubmitWithoutTheDebitAmountIsRejected() {
+        stubHappyPath();
+        stubShortDetails("USD", "DEP");
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                crossRequest("165000000", "IDR", null, null, null, null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+    }
+
+    @Test
+    void aMissingRateForTheDebitCurrencyIs422RateUnavailable() {
+        stubHappyPath();
+        stubShortDetails("USD", "DEP");
+        when(coreTransferClient.fetchRates("02")).thenReturn(List.of());
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                crossRequest("2000", "SGD", "123.45", null, null, null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("RATE_UNAVAILABLE"));
+    }
+
+    @Test
+    void aLoanSourceSameCurrencySubmitFreezesTheProductTypeAlone() {
+        stubHappyPath();
+        stubShortDetails("IDR", "LON");
+
+        service.submit(COMPANY, "budi", crossRequest("10000000", "IDR", null, null, null, null));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        var cross = task.getValue().cross();
+        assertThat(cross.sourceProductType()).isEqualTo("LON");
+        assertThat(cross.debitCcyCd()).isNull();
+        assertThat(cross.baseAmt()).isNull();
+        verify(coreTransferClient, never()).checkUnderlying(any());
+    }
+
+    @Test
+    void theP0WireShapeNeverProbesTheSourceAccount() {
+        stubHappyPath();
+
+        service.submit(COMPANY, "budi", request("10000000"));
+
+        verify(accountNameClient, never()).fetchShortDetails(anyString());
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().cross()).isNull();
+    }
+
+    @Test
+    void aBeneficiaryCurrencyContradictingTheAmountCurrencyIsRejected() {
+        stubHappyPath();
+        var contradictory = new SubmitTransferRequest("budi", SOURCE, BENEFICIARY,
+                "PT MAJU JAYA", new MoneyRequest(new BigDecimal("10000"), "IDR"), "x",
+                new OtpRequest("CH-1", "123456"),
+                null, null, null, null, null, null, null, null, null, null, null, null,
+                "USD", null, null, null, null, null, null, null);
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi", contradictory))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+        verify(accountNameClient, never()).fetchShortDetails(anyString());
+    }
+
+    // ---- P6: cross-currency Transfer ke Bank Lain (valas source, IDR wire) ----
+
+    private static SubmitTransferRequest domesticCrossRequest(String type, String amount,
+                                                              String debitAmount, String rateType) {
+        return new SubmitTransferRequest("budi", SOURCE, "3049530495", "YOSUA PRISKWILA",
+                new MoneyRequest(new BigDecimal(amount), "IDR"), "bayar vendor",
+                new OtpRequest("CH-1", "123456"),
+                type, "DB1", "Jl. Melati 1", null, null, "0811", "12345",
+                null, null, null, null, null,
+                null, debitAmount != null ? new BigDecimal(debitAmount) : null,
+                rateType, null, null, null, null, null);
+    }
+
+    @Test
+    void llgFromAValasSourceFreezesTheDebitBlockAndLaddersTheDebitSide() {
+        stubDomestic();
+        stubShortDetails("USD", "DEP");
+
+        var response = service.submit(COMPANY, "budi",
+                domesticCrossRequest("LLG", "10000000", "610.50", null));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().srvcCd()).isEqualTo(TransferType.SRVC_DOM_LLG);
+        assertThat(task.getValue().trxCcyCd()).isEqualTo("IDR");
+        // The P1 domestic block is unchanged...
+        assertThat(task.getValue().domestic().benBnkCd()).isEqualTo("0140397");
+        assertThat(task.getValue().domestic().feeAmt()).isEqualByComparingTo("2900");
+        // ...and the V7 block is frozen: source currency, debit amount, base = the IDR
+        // credit, regular rate type, no rate call (credit side is IDR), no gate.
+        var cross = task.getValue().cross();
+        assertThat(cross.debitCcyCd()).isEqualTo("USD");
+        assertThat(cross.debitAmt()).isEqualByComparingTo("610.50");
+        assertThat(cross.baseAmt()).isEqualByComparingTo("10000000");
+        assertThat(cross.exchangeRate()).isNull();
+        assertThat(cross.rateType()).isEqualTo("02");
+        assertThat(cross.sourceProductType()).isEqualTo("DEP");
+        verify(coreTransferClient, never()).fetchRates(anyString());
+        verify(coreTransferClient, never()).checkUnderlying(any());
+        // The ladder sees the debit side in USD - the debit amount alone, no IDR fee added.
+        verify(transferMapper).findBankLimit(TransferType.SRVC_DOM_LLG, "USD");
+        verify(transferMapper).findCorpLimit(COMPANY, TransferType.SRVC_DOM_LLG, "USD");
+        // No USD matrix: the IDR one is used with the bands read against the IDR base.
+        verify(transferMapper).findMatrixMasterId(COMPANY, TransferServiceImpl.MENU_CD_BANK_LAIN, "USD");
+        verify(transferMapper).findMatrixMasterId(COMPANY, TransferServiceImpl.MENU_CD_BANK_LAIN, "IDR");
+    }
+
+    @Test
+    void aValasSourceLlgWithoutTheDebitAmountIsRejected() {
+        stubDomestic();
+        stubShortDetails("USD", "DEP");
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticCrossRequest("LLG", "10000000", null, "02")))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"))
+                .hasMessageContaining("Nominal debit");
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void anIdrSourceIgnoresTheDebitFieldsAndStaysSingleLeg() {
+        stubDomestic();
+        stubShortDetails("IDR", "DEP");
+
+        service.submit(COMPANY, "budi", domesticCrossRequest("RTGS", "10000000", "10030000", null));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().cross()).isNull();
+        // Single-leg math: amount + fee, in IDR.
+        verify(transferMapper).findBankLimit(TransferType.SRVC_DOM_RTGS, "IDR");
+        verify(transferMapper, never()).findBankLimit(anyString(), eq("USD"));
+    }
+
+    @Test
+    void aPlainIdrDomesticSubmitNeverProbesTheSourceAccount() {
+        stubDomestic();
+
+        service.submit(COMPANY, "budi", domesticRequest("LLG", "10000000", null));
+
+        verify(accountNameClient, never()).fetchShortDetails(anyString());
+    }
+
+    @Test
+    void onlineFromAValasSourceIsRejected() {
+        stubDomestic();
+        stubShortDetails("USD", "DEP");
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticCrossRequest("ONLINE", "10000000", "610.50", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"))
+                .hasMessageContaining("Online");
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aNonIdrCreditCurrencyOnLlgIsStillRejected() {
+        stubDomestic();
+
+        var request = new SubmitTransferRequest("budi", SOURCE, "3049530495", "YOSUA PRISKWILA",
+                new MoneyRequest(new BigDecimal("1000"), "USD"), "bayar vendor",
+                new OtpRequest("CH-1", "123456"),
+                "LLG", "DB1", "Jl. Melati 1", null, null, "0811", null,
+                null, null, null, null, null);
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi", request))
+                .isInstanceOf(BusinessRuleException.class)
+                .hasMessageContaining("hanya tersedia untuk mata uang IDR");
+        verify(accountNameClient, never()).fetchShortDetails(anyString());
+    }
+
+    @Test
+    void aDebitAmountBreakingTheSourceCurrencysDecimalRuleIsRejectedOnBankLain() {
+        stubDomestic();
+        stubShortDetails("JPY", "DEP");
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                domesticCrossRequest("LLG", "10000000", "100000.50", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+
+    // ---- P3: Transfer ke Virtual Account ----
+
+    private static final String VA_NUMBER = "8241002201234567";
+
+    private static SubmitTransferRequest vaRequest(String amount, String currency,
+                                                   String vaNumber, String inquiryRequestId) {
+        return new SubmitTransferRequest("budi", SOURCE, vaNumber, "PT TOKOPEDIA",
+                new MoneyRequest(new BigDecimal(amount), currency), "bayar tagihan",
+                new OtpRequest("CH-1", "123456"),
+                "VA", null, null, null, null, null, null,
+                null, null, null, null, null,
+                null, null, null, null, null, null, null, null,
+                inquiryRequestId);
+    }
+
+    @Test
+    void vaSubmitBooksUnderTheInHouseMenuWithTheVaServiceFeeAndInquiryId() {
+        stubHappyPath();
+        // The legacy VA format parameter binds the number check.
+        when(transferMapper.findSysParamValue(TransferServiceImpl.SYS_PARAM_VA_FORMAT))
+                .thenReturn("99[0-9]{14}|9[0-9]{15}|8[0-9]{15}");
+
+        var response = service.submit(COMPANY, "budi", vaRequest("150000", "IDR", VA_NUMBER, "INQ-123"));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().menuCd()).isEqualTo(TransferServiceImpl.MENU_CD_VA);
+        assertThat(task.getValue().srvcCd()).isEqualTo(TransferType.SRVC_VA);
+        assertThat(task.getValue().benAcctNo()).isEqualTo(VA_NUMBER);
+        assertThat(task.getValue().benAcctNm()).isEqualTo("PT TOKOPEDIA");
+        assertThat(task.getValue().vaInquiryReqId()).isEqualTo("INQ-123");
+        assertThat(task.getValue().cross()).isNull();
+        // The flat VA fee rides FEE_AMT with the rest of the domestic block empty.
+        var dom = task.getValue().domestic();
+        assertThat(dom.feeAmt()).isEqualByComparingTo("0");
+        assertThat(dom.benDomBnkId()).isNull();
+        // The ladder keys on the VA service code, the matrix on the in-house menu, and
+        // the own/3rd in-house probe never runs for a VA.
+        verify(transferMapper).findBankLimit(TransferType.SRVC_VA, "IDR");
+        verify(transferMapper).findMatrixMasterId(COMPANY, TransferServiceImpl.MENU_CD, "IDR");
+        verify(transferMapper, never()).countAnyAccount(anyString(), anyString());
+        verify(accountNameClient, never()).fetchShortDetails(anyString());
+    }
+
+    @Test
+    void aConfiguredVaFeeIsFrozenOnTheTaskAndLadderedWithTheAmount() {
+        stubHappyPath();
+        var props = new TransferTypeProperties();
+        props.getVa().setFee(new BigDecimal("3000"));
+        service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                accountNameClient, coreTransferClient, authenticatorClient,
+                executionService, executionOutbox, props,
+                mock(PlatformTransactionManager.class));
+        // Company ceiling leaves room for the amount but not for amount + fee.
+        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
+                .thenReturn(new UsageLimitRow(BigDecimal.ZERO, new BigDecimal("151000")));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                vaRequest("150000", "IDR", VA_NUMBER, null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("COMPANY_LIMIT"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aVaSubmitInAForeignCurrencyIsRejected() {
+        stubHappyPath();
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                vaRequest("100", "USD", VA_NUMBER, null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aVaNumberOutsideTheLegacyFormatIsRejectedBeforeTheLadder() {
+        stubHappyPath();
+        when(transferMapper.findSysParamValue(TransferServiceImpl.SYS_PARAM_VA_FORMAT))
+                .thenReturn("8[0-9]{15}");
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                vaRequest("150000", "IDR", "1234567890", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("VA_NUMBER_INVALID"));
+        verify(transferMapper, never()).findBankLimit(anyString(), anyString());
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aMalformedVaFormatParameterFallsBackToTheDigitRule() {
+        stubHappyPath();
+        when(transferMapper.findSysParamValue(TransferServiceImpl.SYS_PARAM_VA_FORMAT))
+                .thenReturn("8[0-9{15}");
+
+        var response = service.submit(COMPANY, "budi", vaRequest("150000", "IDR", VA_NUMBER, null));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                vaRequest("150000", "IDR", "12345", null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("VA_NUMBER_INVALID"));
+    }
+
+    @Test
+    void vaInquiryProxiesTheBillAndAnswersTheConfiguredFee() {
+        stubHappyPath();
+        var props = new TransferTypeProperties();
+        props.getVa().setFee(new BigDecimal("3000"));
+        service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                accountNameClient, coreTransferClient, authenticatorClient,
+                executionService, executionOutbox, props,
+                mock(PlatformTransactionManager.class));
+        when(coreTransferClient.inquireVa(anyString(), eq(VA_NUMBER), eq(SOURCE)))
+                .thenReturn(new CoreTransferClient.VaInquiry(VA_NUMBER, "INQ-123",
+                        "PT TOKOPEDIA", new BigDecimal("150000"), null, "00", "OK"));
+
+        var answer = service.vaInquiry(COMPANY, new VaInquiryRequest("budi", SOURCE, " " + VA_NUMBER + " "));
+
+        assertThat(answer.vaNumber()).isEqualTo(VA_NUMBER);
+        assertThat(answer.name()).isEqualTo("PT TOKOPEDIA");
+        assertThat(answer.amount()).isEqualByComparingTo("150000");
+        assertThat(answer.currency()).isEqualTo("IDR");
+        assertThat(answer.inquiryRequestId()).isEqualTo("INQ-123");
+        assertThat(answer.fee()).isEqualByComparingTo("3000");
+        assertThat(answer.responseCode()).isEqualTo("00");
+        // The inquiry reference is a 20-digit TRX_REF_NO-shaped number that never
+        // touches the shared counter.
+        ArgumentCaptor<String> reference = ArgumentCaptor.forClass(String.class);
+        verify(coreTransferClient).inquireVa(reference.capture(), eq(VA_NUMBER), eq(SOURCE));
+        assertThat(reference.getValue()).matches("\\d{20}");
+        verify(transferMapper, never()).lockRefNoValue(anyString(), anyString());
+    }
+
+    @Test
+    void vaInquiryPassesTheServicesRefusalThroughAsTheMachineCode() {
+        stubHappyPath();
+        when(coreTransferClient.inquireVa(anyString(), eq(VA_NUMBER), eq(SOURCE)))
+                .thenThrow(new BusinessRuleException("VA_INQUIRY_REJECTED", "Client Tidak Ditemukan."));
+
+        assertThatThrownBy(() -> service.vaInquiry(COMPANY, new VaInquiryRequest("budi", SOURCE, VA_NUMBER)))
+                .isInstanceOf(BusinessRuleException.class)
+                .hasMessage("Client Tidak Ditemukan.")
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("VA_INQUIRY_REJECTED"));
+    }
+
+    @Test
+    void vaInquiryRefusesASourceAccountOutsideTheDebitChainWithoutCallingUpstream() {
+        stubHappyPath();
+
+        assertThatThrownBy(() -> service.vaInquiry(COMPANY, new VaInquiryRequest("budi", "999", VA_NUMBER)))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("SOURCE_ACCT_FORBIDDEN"));
+        verify(coreTransferClient, never()).inquireVa(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void vaInquiryForAnUnknownUserIs404() {
+        assertThatThrownBy(() -> service.vaInquiry(COMPANY, new VaInquiryRequest("ghost", SOURCE, VA_NUMBER)))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    void detailNamesAVaTaskByItsServiceNotTheSharedMenuCode() {
+        var task = new TrxTaskRows.TaskRow("T1", "REF1", TransferServiceImpl.MENU_CD_VA,
+                TransferType.SRVC_VA, "EXECUTED", null, new BigDecimal("150000"), "IDR",
+                SOURCE, VA_NUMBER, "PT TOKOPEDIA", "bayar tagihan", "BUDI SANTOSO",
+                java.time.LocalDateTime.now(), 4L, "907409", "20260903100000000042",
+                java.time.LocalDateTime.now(), null, null, null, null, BigDecimal.ZERO, null, null);
+        when(trxTaskMapper.findTask(COMPANY, "T1")).thenReturn(task);
+        when(trxTaskMapper.findActions("T1")).thenReturn(List.of());
+        when(trxTaskMapper.findStages("T1")).thenReturn(List.of());
+
+        var detail = service.detail(COMPANY, "T1", "budi");
+
+        assertThat(detail.menuName()).isEqualTo(TransferServiceImpl.MENU_NAME_VA);
+        assertThat(detail.transferType()).isEqualTo("VA");
+        assertThat(detail.beneficiaryAccountNo()).isEqualTo(VA_NUMBER);
+        assertThat(detail.coreJournal()).isEqualTo("907409");
     }
 }

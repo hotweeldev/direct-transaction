@@ -69,9 +69,11 @@ class TaskApprovalServiceImplTest {
 
     private static TaskRow task(String status, Integer currentStageSeq, long version) {
         return new TaskRow(TASK, "20260831100000228541", TransferServiceImpl.MENU_CD,
+                TransferServiceImpl.SRVC_IN_HOUSE_3RD,
                 status, currentStageSeq, new BigDecimal("10000000"), "IDR",
                 "113179933", "1000533372", "PT MAJU JAYA", "pembayaran vendor",
-                "BUDI SANTOSO", CREATED, version, null, null, null);
+                "BUDI SANTOSO", CREATED, version, null, null, null,
+                null, null, null, null, null, null, null);
     }
 
     private static StageRow stage(int seq, String type, int required, int completed, String status) {

@@ -56,4 +56,16 @@ public final class TaskResponses {
             this(taskId, status, null);
         }
     }
+
+    /**
+     * The answer of a P6 reconciliation. {@code outcome} is what THIS call established:
+     * EXECUTED (leg 2 found, task finalized), REFUNDED (leg 2 provably absent, refund
+     * landed, task FAILED), REFUND_FAILED (refund refused/unknown, task stays UNKNOWN
+     * with REFUND_FAILED), INCONCLUSIVE (nothing proven, nothing moved), NOOP (another
+     * process landed it first). {@code status} / {@code twoLegState} are the task's
+     * values after the call.
+     */
+    public record ReconcileResponse(String taskId, String status, String twoLegState,
+                                    String outcome, String message) {
+    }
 }

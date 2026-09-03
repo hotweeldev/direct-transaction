@@ -155,6 +155,30 @@ app:
     # Parallel listener threads; the VERSION-guarded claim makes concurrency safe.
     concurrency: ${EXECUTION_CONCURRENCY:3}
 
+  transfer:
+    # P1 domestic-transfer constants. Fees are the flat placeholder until the P4 charge
+    # engine (values mirror DEV SYS_PARAM_TRF_SME_LLG / _RTGS); TSA codes are the SOA
+    # samples' constants (no reference table exists in the DIRECT schema for either).
+    llg:
+      fee: ${TRANSFER_LLG_FEE:2900}
+      tsa-code: ${TRANSFER_LLG_TSA_CODE:50}
+    rtgs:
+      fee: ${TRANSFER_RTGS_FEE:30000}
+      tsa-code: ${TRANSFER_RTGS_TSA_CODE:IFT00000}
+    # P2 ONLINE (RTOL / ATM Bersama): flat fee mirrors DEV SYS_PARAM_TRF_SME_ONLINE
+    # (IDR 6,500); the switch protocol carries no TSA code.
+    online:
+      fee: ${TRANSFER_ONLINE_FEE:6500}
+    # P3 Transfer ke Virtual Account: flat fee placeholder (legacy samples book "Biaya
+    # admin Rp0"; DEV SYS_PARAM has no VA fee row - 1006/1007 are the VA number formats).
+    va:
+      fee: ${TRANSFER_VA_FEE:0}
+    intermediary-branch: ${TRANSFER_INTERMEDIARY_BRANCH:760}
+    # P6 reconciliation: the DepTrxInquiry transactionType code direct-integration's
+    # /transfers/status passes through when a two-leg task's leg 2 is looked for on the
+    # simsem account. Code list not in the spec extract (integration confirm item 24).
+    reconcile-transaction-type: ${TRANSFER_RECONCILE_TRX_TYPE:01}
+
   integration:
     # Beneficiary name inquiry via direct-integration's internal core-account endpoint.
     # Unlike direct-account's balance decoration this hop is load-bearing - the inquiry

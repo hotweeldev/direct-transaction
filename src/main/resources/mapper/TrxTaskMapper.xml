@@ -12,17 +12,34 @@
 -->
 <mapper namespace="id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper">
 
+    <!-- The V5 domestic block rides in the nested {@code domestic} record; MyBatis reads
+         a nested property through a null parent as NULL, so in-house tasks leave every
+         V5 column NULL without a second statement. -->
     <insert id="insertTask">
         INSERT INTO TRX_TASK (ID, CORP_ID, MENU_CD, SRVC_CD, REF_NO, STATUS,
                               CURRENT_STAGE_SEQ, REM_ACCT_NO, BEN_ACCT_NO, BEN_ACCT_NM,
                               TRX_AMT, TRX_CCY_CD, REMARK1, REMARK2, REMARK3,
                               INSTRUCTION_MODE, INSTRUCTION_DT, MAKER_USER_ID,
-                              MAKER_USER_NAME, IS_SINGLE_USER, VERSION, CREATED_BY, CREATED_DT)
+                              MAKER_USER_NAME, IS_SINGLE_USER, VERSION, CREATED_BY, CREATED_DT,
+                              BEN_DOM_BNK_ID, BEN_BNK_CD, BEN_BNK_NM, BEN_BNK_BIC,
+                              BEN_ADDR_1, BEN_ADDR_2, BEN_ADDR_3, BEN_PHONE, BEN_POSTAL_CD,
+                              BEN_ID_TYPE, BEN_ID_NO, BEN_TYPE,
+                              LLD_IS_REM_RES, LLD_IS_BEN_RES, FEE_AMT,
+                              DEBIT_CCY_CD, DEBIT_AMT, EXCHANGE_RATE, BASE_AMT, RATE_TYPE,
+                              SOURCE_PRODUCT_TYPE, ADVISORY_MSG, UND_DOC_TYPE, UND_DOC_NO,
+                              UND_DOC_NM, UND_DOC_AMT, UND_DOC_EXPIRY, VA_INQUIRY_REQ_ID)
         VALUES (#{id}, #{corpId}, #{menuCd}, #{srvcCd}, #{refNo}, #{status},
                 #{currentStageSeq}, #{remAcctNo}, #{benAcctNo}, #{benAcctNm},
                 #{trxAmt}, #{trxCcyCd}, #{remark1}, #{remark2}, #{remark3},
                 #{instructionMode}, SYSDATE, #{makerUserId},
-                #{makerUserName}, #{isSingleUser}, 0, #{createdBy}, SYSDATE)
+                #{makerUserName}, #{isSingleUser}, 0, #{createdBy}, SYSDATE,
+                #{domestic.benDomBnkId}, #{domestic.benBnkCd}, #{domestic.benBnkNm}, #{domestic.benBnkBic},
+                #{domestic.benAddr1}, #{domestic.benAddr2}, #{domestic.benAddr3}, #{domestic.benPhone}, #{domestic.benPostalCd},
+                #{domestic.benIdType}, #{domestic.benIdNo}, #{domestic.benType},
+                #{domestic.lldIsRemRes}, #{domestic.lldIsBenRes}, #{domestic.feeAmt},
+                #{cross.debitCcyCd}, #{cross.debitAmt}, #{cross.exchangeRate}, #{cross.baseAmt}, #{cross.rateType},
+                #{cross.sourceProductType}, #{cross.advisoryMsg}, #{cross.undDocType}, #{cross.undDocNo},
+                #{cross.undDocNm}, #{cross.undDocAmt}, #{cross.undDocExpiry}, #{vaInquiryReqId})
     </insert>
 
     <insert id="insertStage">
@@ -54,6 +71,7 @@
         SELECT ID                AS "id",
                REF_NO            AS "refNo",
                MENU_CD           AS "menuCd",
+               SRVC_CD           AS "srvcCd",
                STATUS            AS "status",
                CURRENT_STAGE_SEQ AS "currentStageSeq",
                TRX_AMT           AS "trxAmt",
@@ -67,7 +85,22 @@
                VERSION           AS "version",
                CORE_JOURNAL      AS "coreJournal",
                TRX_REF_NO        AS "trxRefNo",
-               EXECUTED_DT       AS "executedDt"
+               EXECUTED_DT       AS "executedDt",
+               BEN_DOM_BNK_ID    AS "benDomBnkId",
+               BEN_BNK_NM        AS "benBnkNm",
+               BEN_BNK_CD        AS "benBnkCd",
+               BEN_BNK_BIC       AS "benBnkBic",
+               FEE_AMT           AS "feeAmt",
+               RETRIEVAL_REF_NO  AS "retrievalRefNo",
+               INTERBANK_RESPONSE_CD AS "interbankResponseCd",
+               DEBIT_CCY_CD      AS "debitCcyCd",
+               DEBIT_AMT         AS "debitAmt",
+               EXCHANGE_RATE     AS "exchangeRate",
+               SOURCE_PRODUCT_TYPE AS "sourceProductType",
+               ADVISORY_MSG      AS "advisoryMsg",
+               TWO_LEG_STATE     AS "twoLegState",
+               SIMSEM_ACCT_NO    AS "simsemAcctNo",
+               JOURNAL_NO_SIMSEM AS "journalNoSimsem"
         FROM TRX_TASK
         WHERE CORP_ID = #{companyId}
           AND ID = #{taskId}
@@ -197,20 +230,40 @@
     <!-- The execution phase's read: by ID alone, carrying what the core call and the
          BASE_FT write need. Company scope was proven when the task was released. -->
     <select id="findTaskForExecution" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$ExecutionTaskRow">
-        SELECT ID            AS "id",
-               CORP_ID       AS "corpId",
-               MENU_CD       AS "menuCd",
-               SRVC_CD       AS "srvcCd",
-               REF_NO        AS "refNo",
-               STATUS        AS "status",
-               REM_ACCT_NO   AS "remAcctNo",
-               BEN_ACCT_NO   AS "benAcctNo",
-               BEN_ACCT_NM   AS "benAcctNm",
-               TRX_AMT       AS "trxAmt",
-               TRX_CCY_CD    AS "trxCcyCd",
-               REMARK1       AS "remark1",
-               MAKER_USER_ID AS "makerUserId",
-               VERSION       AS "version"
+        SELECT ID             AS "id",
+               CORP_ID        AS "corpId",
+               MENU_CD        AS "menuCd",
+               SRVC_CD        AS "srvcCd",
+               REF_NO         AS "refNo",
+               STATUS         AS "status",
+               REM_ACCT_NO    AS "remAcctNo",
+               BEN_ACCT_NO    AS "benAcctNo",
+               BEN_ACCT_NM    AS "benAcctNm",
+               TRX_AMT        AS "trxAmt",
+               TRX_CCY_CD     AS "trxCcyCd",
+               REMARK1        AS "remark1",
+               MAKER_USER_ID  AS "makerUserId",
+               VERSION        AS "version",
+               BEN_DOM_BNK_ID AS "benDomBnkId",
+               BEN_BNK_CD     AS "benBnkCd",
+               BEN_BNK_BIC    AS "benBnkBic",
+               BEN_ADDR_1     AS "benAddr1",
+               BEN_ADDR_2     AS "benAddr2",
+               BEN_ADDR_3     AS "benAddr3",
+               BEN_PHONE      AS "benPhone",
+               BEN_POSTAL_CD  AS "benPostalCd",
+               BEN_ID_TYPE    AS "benIdType",
+               BEN_ID_NO      AS "benIdNo",
+               BEN_TYPE       AS "benType",
+               LLD_IS_REM_RES AS "lldIsRemRes",
+               LLD_IS_BEN_RES AS "lldIsBenRes",
+               FEE_AMT        AS "feeAmt",
+               DEBIT_CCY_CD   AS "debitCcyCd",
+               DEBIT_AMT      AS "debitAmt",
+               BASE_AMT       AS "baseAmt",
+               RATE_TYPE      AS "rateType",
+               SOURCE_PRODUCT_TYPE AS "sourceProductType",
+               VA_INQUIRY_REQ_ID   AS "vaInquiryReqId"
         FROM TRX_TASK
         WHERE ID = #{taskId}
     </select>
@@ -276,6 +329,103 @@
             UPDATED_DT = SYSDATE
         WHERE TRX_TASK_ID = #{taskId}
           AND STATUS IN (N'WAITING', N'ACTIVE')
+    </update>
+
+    <!-- The interbank switch's trace (P2 ONLINE, V6): the RRN and the ISO-style response
+         code, stored on every outcome where the switch answered at all. Deliberately NOT
+         pinned to a status: the refusal path writes it from its own verdict transaction
+         AFTER the work transaction (and its usage increments) rolled back. -->
+    <update id="updateInterbankResult">
+        UPDATE TRX_TASK
+        SET RETRIEVAL_REF_NO = #{retrievalRefNo},
+            INTERBANK_RESPONSE_CD = #{responseCd},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+    </update>
+
+    <!-- P6 two-leg (simsem) execution. -->
+
+    <!-- The pool account chosen for this task, pinned BEFORE leg 1 leaves (own
+         transaction, committed): should leg 1 time out, reconciliation still knows which
+         holding account to look at. TWO_LEG_STATE is untouched - the in-flight count only
+         moves once leg 1 is confirmed. Guarded on EXECUTING like every mid-execution
+         update. -->
+    <update id="markSimsemSelected">
+        UPDATE TRX_TASK
+        SET SIMSEM_ACCT_NO = #{simsemAcctNo},
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+          AND STATUS = N'EXECUTING'
+    </update>
+
+    <!-- Leg 1 (cross into simsem) confirmed: pin the chosen account and leg-1 journal and
+         advance TWO_LEG_STATE, but keep the task EXECUTING - leg 2 is next. Guarded on
+         EXECUTING like the verdict updates: only the claim holder advances it. VERSION is
+         bumped because the task row materially changed mid-execution. -->
+    <update id="markLeg1Done">
+        UPDATE TRX_TASK
+        SET SIMSEM_ACCT_NO = #{simsemAcctNo},
+            JOURNAL_NO_SIMSEM = #{journalNoSimsem},
+            TWO_LEG_STATE = N'LEG1_DONE',
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+          AND STATUS = N'EXECUTING'
+    </update>
+
+    <!-- The two-leg state alone (LEG2_DONE / REFUND_DONE / REFUND_FAILED). Not pinned to a
+         status: the leg-2 verdict updates the STATUS separately, and the refund path sets
+         this from its own verdict transaction. -->
+    <update id="updateTwoLegState">
+        UPDATE TRX_TASK
+        SET TWO_LEG_STATE = #{twoLegState},
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+    </update>
+
+    <select id="findTwoLegState" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$TwoLegState">
+        SELECT STATUS            AS "status",
+               TWO_LEG_STATE     AS "twoLegState",
+               SIMSEM_ACCT_NO    AS "simsemAcctNo",
+               JOURNAL_NO_SIMSEM AS "journalNoSimsem"
+        FROM TRX_TASK
+        WHERE ID = #{taskId}
+    </select>
+
+    <!-- Reconciliation: leg 2 DID land. Finalize EXECUTED from the exact UNKNOWN +
+         LEG1_DONE pre-state so a concurrent reconcile (or a redelivered sweep) is a
+         no-op. -->
+    <update id="reconcileToExecuted">
+        UPDATE TRX_TASK
+        SET STATUS = N'EXECUTED',
+            CORE_JOURNAL = #{coreJournal},
+            TRX_REF_NO = #{trxRefNo},
+            TWO_LEG_STATE = N'LEG2_DONE',
+            EXECUTED_DT = SYSDATE,
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+          AND STATUS = N'UNKNOWN'
+          AND TWO_LEG_STATE = N'LEG1_DONE'
+    </update>
+
+    <!-- Reconciliation: leg 2 did NOT land, refund ran. Land the terminal status from the
+         same UNKNOWN + LEG1_DONE pre-state (FAILED+REFUND_DONE or UNKNOWN+REFUND_FAILED). -->
+    <update id="reconcileToRefunded">
+        UPDATE TRX_TASK
+        SET STATUS = #{status},
+            TWO_LEG_STATE = #{twoLegState},
+            EXECUTED_DT = SYSDATE,
+            VERSION = VERSION + 1,
+            UPDATED_BY = #{updatedBy},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+          AND STATUS = N'UNKNOWN'
+          AND TWO_LEG_STATE = N'LEG1_DONE'
     </update>
 
 </mapper>

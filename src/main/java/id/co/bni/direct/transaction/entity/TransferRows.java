@@ -85,6 +85,7 @@ public final class TransferRows {
             String benAcctNo,
             String benAcctNm,
             BigDecimal trxAmt,
+            String trxCcyCd,
             String createdBy,
             String updatedBy) {
     }
@@ -99,5 +100,105 @@ public final class TransferRows {
             String aprvLvlCd,
             String usrGrpOpt,
             String corpUsrGrpId) {
+    }
+
+    /**
+     * One COM_MT_DOM_BANK row (direct-bankmodule's DomesticBank master), read never
+     * copied. {@code cd} is EITHER a 7-digit sandi kliring OR a BIC; {@code memberCd}
+     * carries the BIC where present. The same bank appears as multiple rows in legacy
+     * (e.g. Mandiri 0080017 + BMRIIDJA), so codes are taken from the ONE row the user
+     * picked, and shape-validated per method.
+     */
+    public record DomBankRow(
+            String id,
+            String cd,
+            String nm,
+            String memberCd,
+            String onlineCd) {
+    }
+
+    /** CORP's own name/address/phone - the kliring/RTGS sender block. */
+    public record CorpContactRow(String nm, String addr1, String phoneNo) {
+    }
+
+    /**
+     * The BASE_FT row of an executed DOMESTIC (LLG/RTGS) transfer - the in-house column
+     * set plus the beneficiary-bank block the legacy LLG/RTGS rows carry
+     * (BEN_DOM_BNK_ID, BEN_ADDR_1..3, LLD_IS_REM_RES / LLD_IS_BEN_RES, BEN_TYPE,
+     * BIC_SWIFT_CD). {@code ftClass} is the legacy CLASS discriminator, passed in
+     * because it differs per product. Charge columns (CH_TYP_*) stay NULL until P4.
+     */
+    public record BaseFtDomInsert(
+            String id,
+            String ftClass,
+            String mnuCd,
+            String srvcCd,
+            String refNo,
+            String trxRefNo,
+            String remAcctNo,
+            String benAcctNo,
+            String benAcctNm,
+            BigDecimal trxAmt,
+            String benDomBnkId,
+            String benAddr1,
+            String benAddr2,
+            String benAddr3,
+            String lldIsRemRes,
+            String lldIsBenRes,
+            String benType,
+            String bicSwiftCd,
+            String createdBy,
+            String updatedBy,
+            String acctNoSimsem,
+            String journalNoSimsem) {
+
+        /**
+         * The single-leg shape (P1/P2): no simsem account or leg-1 journal - those two
+         * BASE_FT columns stay NULL. The P6 two-leg path uses the full constructor.
+         */
+        public BaseFtDomInsert(String id, String ftClass, String mnuCd, String srvcCd,
+                               String refNo, String trxRefNo, String remAcctNo,
+                               String benAcctNo, String benAcctNm, BigDecimal trxAmt,
+                               String benDomBnkId, String benAddr1, String benAddr2,
+                               String benAddr3, String lldIsRemRes, String lldIsBenRes,
+                               String benType, String bicSwiftCd, String createdBy,
+                               String updatedBy) {
+            this(id, ftClass, mnuCd, srvcCd, refNo, trxRefNo, remAcctNo, benAcctNo,
+                    benAcctNm, trxAmt, benDomBnkId, benAddr1, benAddr2, benAddr3,
+                    lldIsRemRes, lldIsBenRes, benType, bicSwiftCd, createdBy, updatedBy,
+                    null, null);
+        }
+    }
+
+    /**
+     * The legacy {@code VIRTUAL_ACCOUNT_FT} booking row a Transfer ke Virtual Account
+     * writes on success (P3) - the VA-specific final record legacy kept instead of a
+     * BASE_FT row. Column values follow the executed rows in the legacy sample data
+     * (VA_TRX_TYPE 'o', PROCESS_FLAG 'Y', STANDING_INSTRUCTION '1', NOTIFICATION_FLAG
+     * '1', the "No.VA" / "Nama" / "Biaya admin" labels); the table carries no journal
+     * column, so the VA service's journalNum lives on TRX_TASK.CORE_JOURNAL only.
+     *
+     * @param totalAmt   the debited total, principal + fee
+     * @param billedAmt  the principal the VA was credited with (the task's TRX_AMT)
+     * @param createdBy  the maker's CORP_USR id (legacy CREATED_BY is the user row id)
+     * @param updatedBy  the releasing actor
+     */
+    public record VaFtInsert(
+            String id,
+            String corpId,
+            String vaNo,
+            String currency,
+            BigDecimal totalAmt,
+            String vaName,
+            BigDecimal billedAmt,
+            String billedAmtValue,
+            BigDecimal feeAmt,
+            String feeAmtValue,
+            String debitedAcctNo,
+            String refNo,
+            String trxRefNo,
+            String remark,
+            String createdBy,
+            String updatedBy) {
     }
 }
