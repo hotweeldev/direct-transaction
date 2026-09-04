@@ -11,6 +11,7 @@ import id.co.bni.direct.transaction.entity.SimsemRows.SimsemAccount;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ActionInsert;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ExecutionTaskRow;
 import id.co.bni.direct.transaction.integration.CoreTransferClient;
+import id.co.bni.direct.transaction.integration.CoreTransferClient.BiFastOutcome;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.InterbankOutcome;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.TransferOutcome;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
@@ -275,6 +276,9 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         if (TransferType.fromServiceCode(task.srvcCd()) == TransferType.VA) {
             return virtualAccountWork(task, executedBy, amount);
         }
+        if (TransferType.fromServiceCode(task.srvcCd()) == TransferType.BIFAST) {
+            return biFastWork(task, executedBy, amount);
+        }
         if (simsem != null) {
             return twoLegWork(task, executedBy, amount, simsem);
         }
@@ -536,6 +540,71 @@ public class CoreExecutionServiceImpl implements ExecutionService {
     }
 
     /** The legacy VA table's display figure ("Rp0", "Rp10000") - a label, not a number. */
+    /**
+     * The BI-Fast tail of TX-B (P7), entered after the shared ceiling re-checks and usage
+     * increments. One - and only one - credit-transfer off the frozen payload: the
+     * participant BIC in BEN_BNK_CD, the flat fee, the purpose and the creditor block
+     * the inquiry answered (V10), the proxy route when one was used. SUCCESS books the
+     * legacy BASE_FT row with the BI-Fast columns (purpose, beneficiary type, proxy,
+     * trxId, endToEndId) and pins the switch identifiers on the task next to the
+     * journal; REFUSED rolls TX-B back; UNKNOWN keeps the usage counted like every
+     * other money-moving hop.
+     */
+    private ExecutionResult biFastWork(ExecutionTaskRow task, String executedBy,
+                                       BigDecimal amount) {
+        String narrative = notBlank(task.remark1()) ? task.remark1().trim() : task.refNo();
+        if (narrative.length() > 50) {
+            narrative = narrative.substring(0, 50);
+        }
+        BiFastOutcome outcome = coreTransferClient.transferBiFast(
+                new CoreTransferClient.BiFastInstruction(
+                        task.refNo(), task.remAcctNo(), task.benAcctNo(),
+                        CoreTransferClient.amountString(amount),
+                        CoreTransferClient.amountString(nvl(task.feeAmt())),
+                        task.benBnkCd(), task.benAcctNm(),
+                        task.bifastCredId(), task.bifastCredType(), task.bifastCredAcctType(),
+                        task.bifastCredRsdntSts(), task.bifastCredTown(),
+                        task.proxyType(), task.proxyId(),
+                        narrative, task.bifastSettlementDt(), task.bifastPurposeCd()));
+        if (outcome.status() == CoreTransferClient.Status.REFUSED) {
+            throw new CoreRefusedException(outcome.message());
+        }
+        if (outcome.status() == CoreTransferClient.Status.UNKNOWN) {
+            traceBiFast(task.id(), outcome, executedBy);
+            return fail(task, executedBy, "UNKNOWN", outcome.message());
+        }
+        try {
+            String trxRefNo = TransferServiceImpl.nextRefNo(
+                    transferMapper, task.srvcCd(), task.corpId());
+            transferMapper.insertBaseFtDom(new BaseFtDomInsert(
+                    newId(), ftClass(TransferType.BIFAST), task.menuCd(), task.srvcCd(),
+                    task.refNo(), trxRefNo, task.remAcctNo(), task.benAcctNo(),
+                    task.benAcctNm(), amount, task.benDomBnkId(), null, null, null,
+                    null, null, null, task.benBnkBic(), task.makerUserId(), executedBy,
+                    null, null,
+                    task.bifastPurposeCd(), task.bifastCredType(), task.proxyId(),
+                    task.proxyType(), outcome.trxId(), outcome.endToEndId()));
+            trxTaskMapper.markExecuted(task.id(), outcome.coreJournal(), trxRefNo, executedBy);
+            traceBiFast(task.id(), outcome, executedBy);
+            insertExecuteAction(task, executedBy,
+                    "Transfer BI-Fast berhasil. depositJournal=" + outcome.coreJournal()
+                            + " trxId=" + outcome.trxId() + " endToEndId=" + outcome.endToEndId());
+            log.info("Task {} EXECUTED (BI-Fast): journal={} trxId={} endToEndId={} trxRefNo={}",
+                    task.id(), outcome.coreJournal(), outcome.trxId(), outcome.endToEndId(), trxRefNo);
+            return new ExecutionResult("EXECUTED", null);
+        } catch (RuntimeException e) {
+            throw new PostTransferException(outcome.coreJournal(), e);
+        }
+    }
+
+    /** Stores the switch identifiers when it answered them at all; both-null is a no-op. */
+    private void traceBiFast(String taskId, BiFastOutcome outcome, String executedBy) {
+        if (outcome.trxId() == null && outcome.endToEndId() == null) {
+            return;
+        }
+        trxTaskMapper.updateBiFastResult(taskId, outcome.trxId(), outcome.endToEndId(), executedBy);
+    }
+
     private static String rupiah(BigDecimal amount) {
         return "Rp" + nvl(amount).stripTrailingZeros().toPlainString();
     }
@@ -684,6 +753,9 @@ public class CoreExecutionServiceImpl implements ExecutionService {
             case LLG -> "com.aprisma.product.gcm.common.model.LLGFT";
             case RTGS -> "com.aprisma.product.gcm.common.model.RTGSFT";
             case ONLINE -> "com.aprisma.product.gcm.common.model.OnlineFT";
+            // By naming convention with its siblings: no BI-Fast BASE_FT row exists in the
+            // seed extracts to copy the class from (flagged in the P7 notes).
+            case BIFAST -> "com.aprisma.product.gcm.common.model.BIFastFT";
             default -> "com.aprisma.product.gcm.common.model.InHouseFT";
         };
     }

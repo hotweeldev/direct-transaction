@@ -115,7 +115,10 @@ public final class TransferResponses {
             String sourceProductType,
             String twoLegState,
             String simsemAccountNo,
-            String simsemJournalNo) {
+            String simsemJournalNo,
+            String trxId,
+            String endToEndId,
+            String transactionPurpose) {
     }
 
     /**
@@ -126,6 +129,28 @@ public final class TransferResponses {
      * equals {@code code}; null for ONLINE - that wire carries no BIC).
      */
     public record BankResponse(String id, String code, String name, String bic) {
+    }
+
+    /** One BI-Fast transaction purpose (COM_MT_BIFAST_TRX_PURPOSE). */
+    public record BiFastPurposeResponse(String code, String name) {
+    }
+
+    /**
+     * The BI-Fast inquiry answer (P7): the creditor as the switch knows them, the routing
+     * BIC the submit will repeat, the flat fee and the amount the inquiry was priced on.
+     * The creditor block must be echoed on the submit as {@code bifastCreditor}.
+     */
+    public record BiFastInquiryResponse(
+            String beneficiaryName,
+            String receivingBic,
+            String creditorId,
+            String creditorType,
+            String creditorAccountType,
+            String creditorResidentStatus,
+            String creditorTownName,
+            String settlementDate,
+            BigDecimal fee,
+            BigDecimal amount) {
     }
 
     /**

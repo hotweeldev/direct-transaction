@@ -227,4 +227,133 @@ class CoreTransferClientTest {
         assertThatThrownBy(() -> client.inquireVa("REF-1", "8241002201234567", "113179933"))
                 .isInstanceOf(ServiceUnavailableException.class);
     }
+
+
+    // ---- P7: the BI-Fast verdicts and wire ----
+
+    @Test
+    void aBiFastCreditEnvelopeMapsTheSharedVerdictPlusTheSwitchIdentifiers() {
+        var success = CoreTransferClient.mapBiFastResponse(200, json(
+                "{\"data\":{\"coreJournal\":\"900067\",\"trxId\":\"20250925BNINIDJA01075210687\","
+                        + "\"endToEndId\":\"20250925BNINIDJA010O0175210687\",\"reasonCode\":\"U000\"}}"));
+        assertThat(success.status()).isEqualTo(Status.SUCCESS);
+        assertThat(success.coreJournal()).isEqualTo("900067");
+        assertThat(success.trxId()).isEqualTo("20250925BNINIDJA01075210687");
+        assertThat(success.endToEndId()).isEqualTo("20250925BNINIDJA010O0175210687");
+
+        // 2xx without a journal is UNKNOWN, never success - identifiers still read.
+        var noJournal = CoreTransferClient.mapBiFastResponse(200, json(
+                "{\"data\":{\"trxId\":\"X1\",\"reasonCode\":\"U000\"}}"));
+        assertThat(noJournal.status()).isEqualTo(Status.UNKNOWN);
+        assertThat(noJournal.trxId()).isEqualTo("X1");
+
+        var refused = CoreTransferClient.mapBiFastResponse(422, json(
+                "{\"code\":\"BUSINESS_RULE\",\"message\":\"(SOA) ACCOUNT NOT ABLE TO DO TRANSACTION\"}"));
+        assertThat(refused.status()).isEqualTo(Status.REFUSED);
+        assertThat(refused.message()).contains("ACCOUNT NOT ABLE");
+        assertThat(refused.trxId()).isNull();
+
+        assertThat(CoreTransferClient.mapBiFastResponse(504, null).status()).isEqualTo(Status.UNKNOWN);
+    }
+
+    @Test
+    void aBiFastInquiryFourTwentyTwoIsTheSwitchsRefusalAndAFiveXxIsUnavailable() {
+        assertThatThrownBy(() -> CoreTransferClient.mapBiFastInquiryResponse(422, json(
+                "{\"code\":\"BIFAST_INQUIRY_REJECTED\",\"message\":\"(SOA) ACCOUNT NOT ABLE TO DO TRANSACTION\"}")))
+                .isInstanceOf(BusinessRuleException.class)
+                .hasMessage("(SOA) ACCOUNT NOT ABLE TO DO TRANSACTION")
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("BIFAST_INQUIRY_REJECTED"));
+        assertThatThrownBy(() -> CoreTransferClient.mapBiFastInquiryResponse(502, null))
+                .isInstanceOf(ServiceUnavailableException.class);
+
+        var ok = CoreTransferClient.mapBiFastInquiryResponse(200, json(
+                "{\"data\":{\"creditorName\":\"Vastarion\",\"creditorId\":\"23231453124123\","
+                        + "\"creditorType\":\"01\",\"creditorAccountType\":\"SVGS\","
+                        + "\"creditorResidentStatus\":\"01\",\"creditorTownName\":\"0300\","
+                        + "\"settlementDate\":\"2026-09-04\",\"reasonCode\":\"U000\"}}"));
+        assertThat(ok.creditorName()).isEqualTo("Vastarion");
+        assertThat(ok.creditorAccountType()).isEqualTo("SVGS");
+        assertThat(ok.settlementDate()).isEqualTo("2026-09-04");
+        assertThat(ok.creditorRegistrationId()).isNull();
+    }
+
+    @Test
+    void transferBiFastAndInquireBiFastPostToTheirPathsWithTheContractFieldNames() throws Exception {
+        var received = new java.util.concurrent.ConcurrentHashMap<String, String>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/internal/v1/core/transfers/bifast/inquiry", exchange -> {
+            received.put("inquiry", new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            byte[] body = ("{\"data\":{\"creditorName\":\"Vastarion\",\"creditorId\":\"23231453124123\","
+                    + "\"creditorType\":\"01\",\"settlementDate\":\"2026-09-04\",\"reasonCode\":\"U000\"}}")
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.createContext("/internal/v1/core/transfers/bifast", exchange -> {
+            received.put("credit", new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            received.put("creditApiKey", exchange.getRequestHeaders().getFirst("X-Api-Key"));
+            byte[] body = ("{\"data\":{\"coreJournal\":\"900067\",\"trxId\":\"T-1\","
+                    + "\"endToEndId\":\"E-1\",\"reasonCode\":\"U000\",\"message\":\"OK\"}}")
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+        try {
+            IntegrationProperties properties = new IntegrationProperties();
+            properties.setEnabled(true);
+            properties.setApiKey("k-1");
+            properties.setBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
+            CoreTransferClient client = new CoreTransferClient(properties, MAPPER);
+
+            CoreTransferClient.BiFastInquiry inquiry = client.inquireBiFast(
+                    new CoreTransferClient.BiFastInquiryInstruction("REF-1", "113179933", "10000.00",
+                            "2500.00", "BMRIIDJA", "9876543210", null, null, "01"));
+            CoreTransferClient.BiFastOutcome credit = client.transferBiFast(
+                    new CoreTransferClient.BiFastInstruction("REF-2", "113179933", "9876543210",
+                            "10000.00", "2500.00", "BMRIIDJA", "Vastarion", "23231453124123", "01",
+                            "SVGS", "01", "0300", null, null, "bayar", "2026-09-04", "01"));
+
+            assertThat(inquiry.creditorName()).isEqualTo("Vastarion");
+            JsonNode inquiryBody = json(received.get("inquiry"));
+            assertThat(inquiryBody.path("reference").asText()).isEqualTo("REF-1");
+            assertThat(inquiryBody.path("fromAccount").asText()).isEqualTo("113179933");
+            assertThat(inquiryBody.path("amount").asText()).isEqualTo("10000.00");
+            assertThat(inquiryBody.path("fee").asText()).isEqualTo("2500.00");
+            assertThat(inquiryBody.path("receivingBic").asText()).isEqualTo("BMRIIDJA");
+            assertThat(inquiryBody.path("toAccount").asText()).isEqualTo("9876543210");
+            assertThat(inquiryBody.path("transactionPurpose").asText()).isEqualTo("01");
+
+            assertThat(credit.status()).isEqualTo(Status.SUCCESS);
+            assertThat(credit.coreJournal()).isEqualTo("900067");
+            assertThat(credit.trxId()).isEqualTo("T-1");
+            assertThat(credit.endToEndId()).isEqualTo("E-1");
+            assertThat(received.get("creditApiKey")).isEqualTo("k-1");
+            JsonNode creditBody = json(received.get("credit"));
+            assertThat(creditBody.path("reference").asText()).isEqualTo("REF-2");
+            assertThat(creditBody.path("creditorId").asText()).isEqualTo("23231453124123");
+            assertThat(creditBody.path("creditorAccountType").asText()).isEqualTo("SVGS");
+            assertThat(creditBody.path("settlementDate").asText()).isEqualTo("2026-09-04");
+            assertThat(creditBody.path("transactionPurpose").asText()).isEqualTo("01");
+            assertThat(creditBody.path("description").asText()).isEqualTo("bayar");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void inquireBiFastWithTheHopDisabledIsUnavailableWithoutAnyCall() {
+        IntegrationProperties properties = new IntegrationProperties();
+        properties.setEnabled(false);
+        CoreTransferClient client = new CoreTransferClient(properties, MAPPER);
+
+        assertThatThrownBy(() -> client.inquireBiFast(new CoreTransferClient.BiFastInquiryInstruction(
+                "REF-1", "113179933", "10000.00", "2500.00", "BMRIIDJA", "9876543210", null, null, "01")))
+                .isInstanceOf(ServiceUnavailableException.class);
+    }
 }

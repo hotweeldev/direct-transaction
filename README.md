@@ -237,3 +237,42 @@ outward from the simsem account landed and then either finalizes `EXECUTED`/`LEG
 updates are guarded on the exact pre-state, so a repeated call is a no-op. There is no
 scheduled job; the drill for all three outcomes is
 `infra/direct-infra/scripts/p6_e2e_drill.md`.
+
+## P7 - Transfer ke Bank Lain, BI-Fast
+
+**Flow.** The BI-FAST tab of Transfer ke Bank Lain is a two-step wire on the UAT SOA
+switch (`192.168.151.220:55035`, reachable from OCP): `inquiry-transfer` returns the
+beneficiary name plus a creditor block (`credId`, `credType`, `credAccType`,
+`credRsdntStatus`, `credTownName`, `settlementDate`) that `credit-transfer` must echo
+back. So the maker runs "Periksa" first (`POST /api/v1/companies/{companyId}/transfers/bifast/inquiry`),
+the submit carries `transferType: "BIFAST"`, `transactionPurpose` and the echoed block,
+the block is frozen on `TRX_TASK` (V10 `BIFAST_*` columns) and replayed at execution -
+never re-inquired, so what the approver saw is what executes. Purpose codes come from
+legacy `COM_MT_BIFAST_TRX_PURPOSE` via `GET /transfers/bifast/purposes`; the bank list
+from `GET /transfers/banks?method=BIFAST` (the switch wants the 8-char BIC).
+
+**Success rule.** `reasonCode == U000` and, for credit, `depositJournal` non-blank -
+evaluated from the body, because the switch answers refusals as HTTP 200
+(`9004 "(SOA) ACCOUNT NOT ABLE TO DO TRANSACTION"`). Inquiry refusal -> 422
+`BIFAST_INQUIRY_REJECTED` with the switch's sentence; credit refusal -> task `FAILED`;
+no answer -> `UNKNOWN`, usage kept, never retried (`invokeWrite`).
+
+**Booking.** `BASE_FT` like LLG/RTGS plus `BIC_SWIFT_CD` (= receivingBIC),
+`BIFAST_TRX_PURPOSE_CD`, `BI_FAST_BEN_CD` (= credType), `PROXY_ID`, `PROXY_TYPE`,
+`TRX_ID`, `END_TO_END_ID`; `TRX_TASK.CORE_JOURNAL` = `depositJournal`, and `TRX_ID` /
+`END_TO_END_ID` on the task as well (surfaced on the task detail and the receipt).
+
+**Configuration.**
+
+| Where | Key | Default | Meaning |
+|---|---|---|---|
+| direct-integration | `BIFAST_ENABLED` | `true` | switch the client on/off |
+| direct-integration | `BIFAST_BASE_URL` | `http://192.168.151.220:55035` | paths `/bi-fast/inquiry-transfer`, `/bi-fast/credit-transfer` |
+| direct-integration | `BIFAST_CHANNEL` | `BNIDIRECT` | accepted on UAT; PROD registration to confirm |
+| direct-transaction | `TRANSFER_BIFAST_FEE` | `2500` | fallback only - the live value is read from `SYS_PARAM_TRF_SME_BIFAST` (`Real Time|IDR 1,000|IDR 250,000,000 per transaksi, sehari 1 M|IDR 2,500`) like the LLG/RTGS rows |
+
+Spec: `be/direct-integration/docs/core-services/BI-FAST Inquiry-Credit Transfer.md`.
+Drill: `infra/direct-infra/scripts/p7_bifast_e2e.md`; probe: `p7_bifast_probe.py`.
+Not built yet: proxy/alias destinations (`isProxy=true`), scheduled transfers, and a
+reconciliation path for a BI-Fast `UNKNOWN` (the switch has no status lookup we know of;
+settle by `endToEndId` with the SOA team).

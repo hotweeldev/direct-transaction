@@ -4,6 +4,7 @@ import id.co.bni.direct.transaction.dto.request.TransferRequests.InquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.InterbankInquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.OtpChallengeRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.SubmitTransferRequest;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.BiFastInquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.VaInquiryRequest;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.BankResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.InquiryResponse;
@@ -12,6 +13,8 @@ import id.co.bni.direct.transaction.dto.response.TransferResponses.MethodInfoRes
 import id.co.bni.direct.transaction.dto.response.TransferResponses.OtpChallengeResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.SubmitResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.TaskDetailResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.BiFastInquiryResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.BiFastPurposeResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.VaInquiryResponse;
 
 import java.util.List;
@@ -103,6 +106,21 @@ public class TransferController {
     }
 
     /** A fresh OTP challenge for the maker, from the UMAS authenticator. */
+    /** P7: the BI-Fast transaction purposes (reference data, no user binding needed). */
+    @GetMapping("/bifast/purposes")
+    public ResponseEntity<List<BiFastPurposeResponse>> bifastPurposes(@PathVariable String companyId) {
+        return ResponseEntity.ok(transferService.bifastPurposes(companyId));
+    }
+
+    @PostMapping("/bifast/inquiry")
+    public ResponseEntity<BiFastInquiryResponse> bifastInquiry(
+            @PathVariable String companyId,
+            @Valid @RequestBody BiFastInquiryRequest request,
+            HttpServletRequest servletRequest) {
+        TokenIdentity.requireSameUser(servletRequest, request.userId());
+        return ResponseEntity.ok(transferService.bifastInquiry(companyId, request));
+    }
+
     @PostMapping("/otp/challenge")
     public ResponseEntity<OtpChallengeResponse> otpChallenge(@PathVariable String companyId,
                                                              @Valid @RequestBody OtpChallengeRequest request,

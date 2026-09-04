@@ -1,5 +1,7 @@
 package id.co.bni.direct.transaction.entity;
 
+import org.apache.ibatis.annotations.AutomapConstructor;
+
 import java.math.BigDecimal;
 
 /**
@@ -114,7 +116,22 @@ public final class TransferRows {
             String cd,
             String nm,
             String memberCd,
-            String onlineCd) {
+            String onlineCd,
+            String bifastCd) {
+
+        /** MyBatis builds rows through the canonical constructor (see TaskRow). */
+        @AutomapConstructor
+        public DomBankRow {
+        }
+
+        /** The pre-P7 shape - callers that never look at the BI-Fast code. */
+        public DomBankRow(String id, String cd, String nm, String memberCd, String onlineCd) {
+            this(id, cd, nm, memberCd, onlineCd, null);
+        }
+    }
+
+    /** One COM_MT_BIFAST_TRX_PURPOSE row: the transactionPurpose code and its label. */
+    public record BiFastPurposeRow(String cd, String nm) {
     }
 
     /** CORP's own name/address/phone - the kliring/RTGS sender block. */
@@ -150,7 +167,27 @@ public final class TransferRows {
             String createdBy,
             String updatedBy,
             String acctNoSimsem,
-            String journalNoSimsem) {
+            String journalNoSimsem,
+            String bifastPurposeCd,
+            String biFastBenCd,
+            String proxyId,
+            String proxyType,
+            String trxId,
+            String endToEndId) {
+
+        /** The pre-P7 shape (single-leg and two-leg rows without BI-Fast identifiers). */
+        public BaseFtDomInsert(String id, String ftClass, String mnuCd, String srvcCd,
+                               String refNo, String trxRefNo, String remAcctNo,
+                               String benAcctNo, String benAcctNm, BigDecimal trxAmt,
+                               String benDomBnkId, String benAddr1, String benAddr2,
+                               String benAddr3, String lldIsRemRes, String lldIsBenRes,
+                               String benType, String bicSwiftCd, String createdBy,
+                               String updatedBy, String acctNoSimsem, String journalNoSimsem) {
+            this(id, ftClass, mnuCd, srvcCd, refNo, trxRefNo, remAcctNo, benAcctNo,
+                    benAcctNm, trxAmt, benDomBnkId, benAddr1, benAddr2, benAddr3,
+                    lldIsRemRes, lldIsBenRes, benType, bicSwiftCd, createdBy, updatedBy,
+                    acctNoSimsem, journalNoSimsem, null, null, null, null, null, null);
+        }
 
         /**
          * The single-leg shape (P1/P2): no simsem account or leg-1 journal - those two

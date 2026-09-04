@@ -33,6 +33,12 @@ public class TransferTypeProperties {
      * override per environment with TRANSFER_VA_FEE. No TSA code on the VA wire.
      */
     private final Method va = new Method(BigDecimal.ZERO, null);
+    /**
+     * P7 BI-Fast: fee fallback when the DEV SYS_PARAM_TRF_SME_BIFAST row is missing or
+     * unparsable (its fee token reads IDR 2,500). Override with TRANSFER_BIFAST_FEE. No
+     * TSA code - the BI-Fast wire carries the fee as its own field.
+     */
+    private final Method bifast = new Method(new BigDecimal("2500"), null);
 
     /** Sent as {@code intermediaryBranch}; mandatory on the RTGS operation. */
     private String intermediaryBranch = "760";
@@ -60,6 +66,10 @@ public class TransferTypeProperties {
 
     public Method getVa() {
         return va;
+    }
+
+    public Method getBifast() {
+        return bifast;
     }
 
     public String getIntermediaryBranch() {

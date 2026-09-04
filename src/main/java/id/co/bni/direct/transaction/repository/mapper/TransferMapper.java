@@ -125,6 +125,18 @@ public interface TransferMapper {
     /** The ONLINE (RTOL / ATM Bersama) picker: live rows carrying a 3-digit ONLINE_CD. */
     List<TransferRows.DomBankRow> findOnlineBanks();
 
+    /**
+     * P7: the BI-Fast participant banks - every active COM_MT_DOM_BANK row carrying a
+     * BIFAST_CD (the receivingBIC the switch routes on). 37 rows on DEV.
+     */
+    List<TransferRows.DomBankRow> findBiFastBanks();
+
+    /** P7: the active BI-Fast transaction purposes (COM_MT_BIFAST_TRX_PURPOSE). */
+    List<TransferRows.BiFastPurposeRow> findBiFastPurposes();
+
+    /** P7: 1 when the purpose code is an active, non-deleted COM_MT_BIFAST_TRX_PURPOSE row. */
+    int countBiFastPurpose(@Param("cd") String cd);
+
     /** SYS_PARAM.VALUE by CD (live rows only), or null when missing or soft-deleted. */
     String findSysParamValue(@Param("cd") String cd);
 

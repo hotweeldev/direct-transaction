@@ -11,11 +11,17 @@ package id.co.bni.direct.transaction.service;
  */
 public enum TransferType {
 
-    BNI, LLG, RTGS, ONLINE, VA;
+    BNI, LLG, RTGS, ONLINE, VA, BIFAST;
 
     public static final String SRVC_DOM_LLG = "GCM_FTR_DOM_LLG";
     public static final String SRVC_DOM_RTGS = "GCM_FTR_DOM_RTGS";
     public static final String SRVC_DOM_ONLINE = "GCM_FTR_DOM_ONLINE";
+    /**
+     * Transfer ke Bank Lain via BI-Fast (P7): the legacy domestic service code the
+     * limits (BANK_TRX_LMT, CORP_LMT_PC_DTL) are keyed on; the approval matrix is keyed
+     * on the shared Bank Lain menu like LLG/RTGS/ONLINE.
+     */
+    public static final String SRVC_DOM_BIFAST = "GCM_FTR_DOM_BIFAST";
     /**
      * Transfer ke Virtual Account (P3): the legacy COM_ST_SRVC "VA Billing Single" service
      * (currency category IDR). Limits (BANK_TRX_LMT, CORP_LMT_PC_DTL) are keyed on it in
@@ -35,6 +41,7 @@ public enum TransferType {
             case "RTGS" -> RTGS;
             case "ONLINE", "RTOL" -> ONLINE;
             case "VA", "VIRTUAL_ACCOUNT" -> VA;
+            case "BIFAST", "BI-FAST", "BI_FAST" -> BIFAST;
             default -> throw new IllegalArgumentException("Jenis transfer tidak dikenal: " + wire);
         };
     }
@@ -53,12 +60,20 @@ public enum TransferType {
         if (SRVC_VA.equals(srvcCd)) {
             return VA;
         }
+        if (SRVC_DOM_BIFAST.equals(srvcCd)) {
+            return BIFAST;
+        }
         return BNI;
     }
 
     /** A Transfer ke Bank Lain product: the beneficiary lives at another bank. */
     public boolean isDomestic() {
-        return this == LLG || this == RTGS || this == ONLINE;
+        return this == LLG || this == RTGS || this == ONLINE || this == BIFAST;
+    }
+
+    /** BI-Fast (P7): a domestic product with its own two-call wire (inquiry-transfer, credit-transfer). */
+    public boolean isBiFast() {
+        return this == BIFAST;
     }
 
     /** Transfer ke Virtual Account: neither in-house nor domestic - its own wire and booking table. */

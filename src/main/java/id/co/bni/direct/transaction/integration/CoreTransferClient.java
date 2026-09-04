@@ -52,6 +52,8 @@ public class CoreTransferClient {
     private static final String STATUS_PATH = "/internal/v1/core/transfers/status";
     private static final String VA_PATH = "/internal/v1/core/transfers/va";
     private static final String VA_INQUIRY_PATH = "/internal/v1/core/transfers/va/inquiry";
+    private static final String BIFAST_PATH = "/internal/v1/core/transfers/bifast";
+    private static final String BIFAST_INQUIRY_PATH = "/internal/v1/core/transfers/bifast/inquiry";
 
     /** The contract caps narrative at 50 characters. */
     private static final int NARRATIVE_MAX = 50;
@@ -269,6 +271,76 @@ public class CoreTransferClient {
                             String responseCode, String responseMessage) {
     }
 
+    /**
+     * The BI-Fast credit-transfer instruction (P7) - field-for-field the integration
+     * contract's request. The creditor block repeats what the inquiry answered; amounts
+     * are decimal strings; {@code proxyType}/{@code proxyValue} null on the account route.
+     */
+    public record BiFastInstruction(
+            String reference,
+            String fromAccount,
+            String toAccount,
+            String amount,
+            String fee,
+            String receivingBic,
+            String creditorName,
+            String creditorId,
+            String creditorType,
+            String creditorAccountType,
+            String creditorResidentStatus,
+            String creditorTownName,
+            String proxyType,
+            String proxyValue,
+            String description,
+            String settlementDate,
+            String transactionPurpose) {
+    }
+
+    /**
+     * A BI-Fast credit verdict: the shared {@link TransferOutcome} (SUCCESS with the switch's
+     * depositJournal as coreJournal, REFUSED, UNKNOWN) plus the switch's own identifiers,
+     * present on SUCCESS and, when the switch answered them, on the other verdicts too.
+     */
+    public record BiFastOutcome(TransferOutcome outcome, String trxId, String endToEndId) {
+        public Status status() {
+            return outcome.status();
+        }
+
+        public String coreJournal() {
+            return outcome.coreJournal();
+        }
+
+        public String message() {
+            return outcome.message();
+        }
+    }
+
+    /** The BI-Fast inquiry-transfer instruction (P7) - the integration contract's request. */
+    public record BiFastInquiryInstruction(
+            String reference,
+            String fromAccount,
+            String amount,
+            String fee,
+            String receivingBic,
+            String toAccount,
+            String proxyType,
+            String proxyValue,
+            String transactionPurpose) {
+    }
+
+    /** The BI-Fast inquiry answer: the creditor as the switch knows them (nulls allowed). */
+    public record BiFastInquiry(
+            String creditorName,
+            String creditorId,
+            String creditorType,
+            String creditorAccountType,
+            String creditorResidentStatus,
+            String creditorTownName,
+            String creditorRegistrationId,
+            String settlementDate,
+            String reasonCode) {
+    }
+
     private final IntegrationProperties properties;
     private final ObjectMapper objectMapper;
     private final RestClient restClient;
@@ -399,6 +471,93 @@ public class CoreTransferClient {
     }
 
     /** One attempt at an outward RTGS transfer. Never retried. */
+    /**
+     * One attempt at a BI-Fast credit transfer (P7). Never retried: the switch debits the
+     * customer, so an unanswered call is UNKNOWN like every other money-moving hop. The
+     * verdict is the shared mapping (coreJournal = the switch's depositJournal); trxId and
+     * endToEndId are read additively from the same envelope.
+     */
+    public BiFastOutcome transferBiFast(BiFastInstruction instruction) {
+        try {
+            return restClient.post()
+                    .uri(BIFAST_PATH)
+                    .header("X-Api-Key", properties.getApiKey())
+                    .header("X-Correlation-Id", CorrelationContext.currentCorrelationId())
+                    .body(instruction)
+                    .exchange((request, response) -> mapBiFastResponse(
+                            response.getStatusCode().value(), readSilently(response)));
+        } catch (Exception e) {
+            log.warn("BI-Fast credit call failed at transport level: {}", e.getMessage());
+            return new BiFastOutcome(new TransferOutcome(Status.UNKNOWN, null,
+                    "Panggilan ke BI-Fast gagal: status transfer tidak dapat dipastikan."),
+                    null, null);
+        }
+    }
+
+    static BiFastOutcome mapBiFastResponse(int status, JsonNode root) {
+        TransferOutcome outcome = mapTransferResponse(BIFAST_PATH, status, root);
+        JsonNode data = root != null && root.has("data") ? root.path("data") : root;
+        return new BiFastOutcome(outcome,
+                data == null ? null : data.path("trxId").asText(null),
+                data == null ? null : data.path("endToEndId").asText(null));
+    }
+
+    /**
+     * The BI-Fast beneficiary inquiry (P7) - a read: the switch's refusal (422 with the
+     * switch's own reason text, e.g. "(SOA) ACCOUNT NOT ABLE TO DO TRANSACTION") is data
+     * and becomes this pipeline's {@code BIFAST_INQUIRY_REJECTED}; only transport failure
+     * and a disabled hop are a 503.
+     */
+    public BiFastInquiry inquireBiFast(BiFastInquiryInstruction instruction) {
+        if (!properties.isEnabled()) {
+            throw new ServiceUnavailableException(
+                    "Layanan inquiry BI-Fast sedang tidak tersedia. Silakan coba lagi nanti.");
+        }
+        try {
+            return restClient.post()
+                    .uri(BIFAST_INQUIRY_PATH)
+                    .header("X-Api-Key", properties.getApiKey())
+                    .header("X-Correlation-Id", CorrelationContext.currentCorrelationId())
+                    .body(instruction)
+                    .exchange((request, response) -> mapBiFastInquiryResponse(
+                            response.getStatusCode().value(), readSilently(response)));
+        } catch (BusinessRuleException | ServiceUnavailableException e) {
+            throw e;
+        } catch (Exception e) {
+            log.warn("BI-Fast inquiry call failed: {}", e.getMessage());
+            throw new ServiceUnavailableException(
+                    "Layanan inquiry BI-Fast sedang tidak tersedia. Silakan coba lagi nanti.");
+        }
+    }
+
+    static BiFastInquiry mapBiFastInquiryResponse(int httpStatus, JsonNode root) {
+        if (httpStatus == 422) {
+            String message = root != null ? root.path("message").asText(null) : null;
+            throw new BusinessRuleException("BIFAST_INQUIRY_REJECTED",
+                    message != null ? message : "Rekening tujuan BI-Fast tidak dapat diproses.");
+        }
+        if (httpStatus < 200 || httpStatus >= 300) {
+            log.warn("BI-Fast inquiry answered {}", httpStatus);
+            throw new ServiceUnavailableException(
+                    "Layanan inquiry BI-Fast sedang bermasalah. Silakan coba lagi nanti.");
+        }
+        JsonNode data = root != null && root.has("data") ? root.path("data") : root;
+        if (data == null || data.isMissingNode() || data.isNull()) {
+            throw new ServiceUnavailableException(
+                    "Layanan inquiry BI-Fast menjawab dengan format yang tidak dikenal.");
+        }
+        return new BiFastInquiry(
+                data.path("creditorName").asText(null),
+                data.path("creditorId").asText(null),
+                data.path("creditorType").asText(null),
+                data.path("creditorAccountType").asText(null),
+                data.path("creditorResidentStatus").asText(null),
+                data.path("creditorTownName").asText(null),
+                data.path("creditorRegistrationId").asText(null),
+                data.path("settlementDate").asText(null),
+                data.path("reasonCode").asText(null));
+    }
+
     public TransferOutcome transferRtgs(RtgsInstruction instruction) {
         return post(RTGS_PATH, objectMapper.valueToTree(instruction));
     }

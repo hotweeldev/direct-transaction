@@ -9,6 +9,7 @@ import id.co.bni.direct.transaction.dto.request.TransferRequests.SubmitTransferR
 import id.co.bni.direct.transaction.config.TransferTypeProperties;
 import id.co.bni.direct.transaction.entity.TransferRows.BankLimitRow;
 import id.co.bni.direct.transaction.entity.TransferRows.CorpFlagsRow;
+import id.co.bni.direct.transaction.entity.TransferRows.BiFastPurposeRow;
 import id.co.bni.direct.transaction.entity.TransferRows.DomBankRow;
 import id.co.bni.direct.transaction.entity.TransferRows.MakerRow;
 import id.co.bni.direct.transaction.entity.TransferRows.MatrixBandRow;
@@ -42,6 +43,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.BiFastCreditorRequest;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.BiFastInquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.VaInquiryRequest;
 import id.co.bni.direct.transaction.exception.NotFoundException;
 
@@ -1411,5 +1414,294 @@ class TransferServiceImplTest {
         assertThat(detail.transferType()).isEqualTo("VA");
         assertThat(detail.beneficiaryAccountNo()).isEqualTo(VA_NUMBER);
         assertThat(detail.coreJournal()).isEqualTo("907409");
+    }
+
+
+    // ---- P7: Transfer ke Bank Lain via BI-Fast ----
+
+    private static final String BIFAST_SYS_PARAM =
+            "Real Time|IDR 1,000|IDR 250,000,000 per transaksi, sehari 1 M|IDR 2,500";
+
+    private static SubmitTransferRequest bifastRequest(String amount, String currency,
+                                                       String purpose, BiFastCreditorRequest creditor) {
+        return new SubmitTransferRequest("budi", SOURCE, "9876543210", "TUMPAL YAN RAYMOND TEST",
+                new MoneyRequest(new BigDecimal(amount), currency), "bayar vendor",
+                new OtpRequest("CH-1", "123456"),
+                "BIFAST", "DB2", null, null, null, null, null,
+                null, null, null, null, null,
+                null, null, null, null, null, null, null, null,
+                null, purpose, null, null, creditor);
+    }
+
+    private static BiFastCreditorRequest creditor() {
+        return new BiFastCreditorRequest("23231453124123", "01", "SVGS", "01", "0300", "2026-09-04");
+    }
+
+    private void stubBiFast() {
+        stubHappyPath();
+        when(transferMapper.findDomBank("DB2"))
+                .thenReturn(new DomBankRow("DB2", "00800172", "BANK MANDIRI", "BMRIIDJA", "008", "BMRIIDJA"));
+        when(transferMapper.findMatrixMasterId(COMPANY,
+                TransferServiceImpl.MENU_CD_BANK_LAIN, "IDR")).thenReturn("MSTR1");
+        when(transferMapper.countBiFastPurpose("01")).thenReturn(1);
+        when(transferMapper.findSysParamValue(TransferServiceImpl.SYS_PARAM_BIFAST))
+                .thenReturn(BIFAST_SYS_PARAM);
+    }
+
+    @Test
+    void bifastSubmitFreezesTheParticipantBicPurposeCreditorBlockAndSysParamFee() {
+        stubBiFast();
+
+        var response = service.submit(COMPANY, "budi", bifastRequest("10000000", "IDR", "01", creditor()));
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().menuCd()).isEqualTo(TransferServiceImpl.MENU_CD_BANK_LAIN);
+        assertThat(task.getValue().srvcCd()).isEqualTo(TransferType.SRVC_DOM_BIFAST);
+        var dom = task.getValue().domestic();
+        assertThat(dom.benDomBnkId()).isEqualTo("DB2");
+        assertThat(dom.benBnkCd()).isEqualTo("BMRIIDJA");
+        assertThat(dom.benBnkBic()).isEqualTo("BMRIIDJA");
+        assertThat(dom.benType()).isNull();
+        // The fee comes from the legacy SYS_PARAM row, not the config fallback.
+        assertThat(dom.feeAmt()).isEqualByComparingTo("2500");
+        var bifast = task.getValue().bifast();
+        assertThat(bifast.purposeCd()).isEqualTo("01");
+        assertThat(bifast.credId()).isEqualTo("23231453124123");
+        assertThat(bifast.credType()).isEqualTo("01");
+        assertThat(bifast.credAcctType()).isEqualTo("SVGS");
+        assertThat(bifast.credRsdntSts()).isEqualTo("01");
+        assertThat(bifast.credTown()).isEqualTo("0300");
+        assertThat(bifast.settlementDt()).isEqualTo("2026-09-04");
+        assertThat(bifast.proxyType()).isNull();
+        assertThat(task.getValue().cross()).isNull();
+        // Ladder on the BI-Fast service code, matrix on the shared Bank Lain menu, no
+        // own/3rd probe, no source-currency probe for a plain IDR submit.
+        verify(transferMapper).findBankLimit(TransferType.SRVC_DOM_BIFAST, "IDR");
+        verify(transferMapper).findMatrixMasterId(COMPANY, TransferServiceImpl.MENU_CD_BANK_LAIN, "IDR");
+        verify(transferMapper, never()).countAnyAccount(anyString(), anyString());
+        verify(accountNameClient, never()).fetchShortDetails(anyString());
+    }
+
+    @Test
+    void theBiFastLadderValidatesAmountPlusFeeAndFallsBackToTheConfiguredFee() {
+        stubBiFast();
+        when(transferMapper.findSysParamValue(TransferServiceImpl.SYS_PARAM_BIFAST)).thenReturn(null);
+        // Room for the amount but not for amount + the 2,500 fallback fee.
+        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
+                .thenReturn(new UsageLimitRow(BigDecimal.ZERO, new BigDecimal("10001000")));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                bifastRequest("10000000", "IDR", "01", creditor())))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("COMPANY_LIMIT"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aBiFastPurposeOutsideTheLegacyTableIsRejectedBeforeTheLadder() {
+        stubBiFast();
+        when(transferMapper.countBiFastPurpose("07")).thenReturn(0);
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                bifastRequest("10000000", "IDR", "07", creditor())))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("BIFAST_PURPOSE_INVALID"));
+        verify(transferMapper, never()).findBankLimit(anyString(), anyString());
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aBiFastSubmitInAForeignCurrencyIsRejected() {
+        stubBiFast();
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                bifastRequest("100", "USD", "01", creditor())))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aBankWithoutABiFastCodeIsRefusedOnTheBiFastTab() {
+        stubBiFast();
+        when(transferMapper.findDomBank("DB2"))
+                .thenReturn(new DomBankRow("DB2", "0140397", "BANK BCA", "CENAIDJA", "014", null));
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                bifastRequest("10000000", "IDR", "01", creditor())))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("BENEFICIARY_BANK_INVALID"));
+    }
+
+    @Test
+    void aBiFastFromAValasSourceIsRejectedLikeOnline() {
+        stubBiFast();
+        stubShortDetails("USD", "DEP");
+        var valas = new SubmitTransferRequest("budi", SOURCE, "9876543210", "TUMPAL",
+                new MoneyRequest(new BigDecimal("10000000"), "IDR"), "bayar vendor",
+                new OtpRequest("CH-1", "123456"),
+                "BIFAST", "DB2", null, null, null, null, null,
+                null, null, null, null, null,
+                null, new BigDecimal("650"), null, null, null, null, null, null,
+                null, "01", null, null, creditor());
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi", valas))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("TRANSFER_FIELDS_INVALID"));
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void bifastSubmitFreezesTheProxyRouteWhenOneIsSent() {
+        stubBiFast();
+        var proxy = new SubmitTransferRequest("budi", SOURCE, "081234567890", "TUMPAL",
+                new MoneyRequest(new BigDecimal("10000000"), "IDR"), "bayar vendor",
+                new OtpRequest("CH-1", "123456"),
+                "BIFAST", "DB2", null, null, null, null, null,
+                null, null, null, null, null,
+                null, null, null, null, null, null, null, null,
+                null, "01", "01", "081234567890", null);
+
+        service.submit(COMPANY, "budi", proxy);
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().bifast().proxyType()).isEqualTo("01");
+        assertThat(task.getValue().bifast().proxyId()).isEqualTo("081234567890");
+        // No creditor echo sent: the block stays null and the switch decides at release.
+        assertThat(task.getValue().bifast().credId()).isNull();
+    }
+
+    @Test
+    void banksForBiFastAnswerTheParticipantBicAsBothCodeAndBic() {
+        when(transferMapper.findBiFastBanks()).thenReturn(List.of(
+                new DomBankRow("DB2", "00800172", "BANK MANDIRI", "BMRIIDJA", "008", "BMRIIDJA")));
+
+        var banks = service.banks(COMPANY, "BI-FAST");
+
+        assertThat(banks).hasSize(1);
+        assertThat(banks.get(0).id()).isEqualTo("DB2");
+        assertThat(banks.get(0).code()).isEqualTo("BMRIIDJA");
+        assertThat(banks.get(0).bic()).isEqualTo("BMRIIDJA");
+        verify(transferMapper, never()).findClearingBanks();
+    }
+
+    @Test
+    void bifastPurposesListTheActiveLegacyCodes() {
+        when(transferMapper.findBiFastPurposes()).thenReturn(List.of(
+                new BiFastPurposeRow("01", "Investment"), new BiFastPurposeRow("99", "Others")));
+
+        var purposes = service.bifastPurposes(COMPANY);
+
+        assertThat(purposes).extracting("code").containsExactly("01", "99");
+        assertThat(purposes.get(0).name()).isEqualTo("Investment");
+    }
+
+    @Test
+    void methodInfoForBiFastReadsItsOwnSysParamRow() {
+        when(transferMapper.findSysParamValue(TransferServiceImpl.SYS_PARAM_BIFAST))
+                .thenReturn(BIFAST_SYS_PARAM);
+
+        var info = service.methodInfo(COMPANY, "BIFAST");
+
+        assertThat(info.method()).isEqualTo("BIFAST");
+        assertThat(info.minAmount()).isEqualByComparingTo("1000");
+        assertThat(info.maxAmount()).isEqualByComparingTo("250000000");
+        assertThat(info.fee()).isEqualByComparingTo("2500");
+        assertThat(info.estimatedDuration()).isEqualTo("Real Time");
+    }
+
+    @Test
+    void bifastInquiryRoutesTheParticipantBicPricesTheFeeAndAnswersTheCreditor() {
+        stubBiFast();
+        when(coreTransferClient.inquireBiFast(any()))
+                .thenReturn(new CoreTransferClient.BiFastInquiry("Vastarion", "23231453124123", "01",
+                        "SVGS", "01", "0300", "", "2026-09-04", "U000"));
+
+        var answer = service.bifastInquiry(COMPANY, new BiFastInquiryRequest(
+                "budi", SOURCE, "DB2", " 9876543210 ", new BigDecimal("10000"), "01", null, null));
+
+        assertThat(answer.beneficiaryName()).isEqualTo("Vastarion");
+        assertThat(answer.receivingBic()).isEqualTo("BMRIIDJA");
+        assertThat(answer.creditorId()).isEqualTo("23231453124123");
+        assertThat(answer.creditorType()).isEqualTo("01");
+        assertThat(answer.creditorAccountType()).isEqualTo("SVGS");
+        assertThat(answer.creditorResidentStatus()).isEqualTo("01");
+        assertThat(answer.creditorTownName()).isEqualTo("0300");
+        assertThat(answer.settlementDate()).isEqualTo("2026-09-04");
+        assertThat(answer.fee()).isEqualByComparingTo("2500");
+        assertThat(answer.amount()).isEqualByComparingTo("10000");
+        ArgumentCaptor<CoreTransferClient.BiFastInquiryInstruction> sent =
+                ArgumentCaptor.forClass(CoreTransferClient.BiFastInquiryInstruction.class);
+        verify(coreTransferClient).inquireBiFast(sent.capture());
+        assertThat(sent.getValue().reference()).matches("\\d{20}");
+        assertThat(sent.getValue().fromAccount()).isEqualTo(SOURCE);
+        assertThat(sent.getValue().amount()).isEqualTo("10000.00");
+        assertThat(sent.getValue().fee()).isEqualTo("2500.00");
+        assertThat(sent.getValue().receivingBic()).isEqualTo("BMRIIDJA");
+        assertThat(sent.getValue().toAccount()).isEqualTo("9876543210");
+        assertThat(sent.getValue().proxyValue()).isNull();
+        assertThat(sent.getValue().transactionPurpose()).isEqualTo("01");
+        verify(transferMapper, never()).lockRefNoValue(anyString(), anyString());
+    }
+
+    @Test
+    void bifastInquiryPassesTheSwitchRefusalThroughAsTheMachineCode() {
+        stubBiFast();
+        when(coreTransferClient.inquireBiFast(any()))
+                .thenThrow(new BusinessRuleException("BIFAST_INQUIRY_REJECTED",
+                        "(SOA) ACCOUNT NOT ABLE TO DO TRANSACTION"));
+
+        assertThatThrownBy(() -> service.bifastInquiry(COMPANY, new BiFastInquiryRequest(
+                "budi", SOURCE, "DB2", "9876543210", new BigDecimal("10000"), "01", null, null)))
+                .isInstanceOf(BusinessRuleException.class)
+                .hasMessage("(SOA) ACCOUNT NOT ABLE TO DO TRANSACTION")
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("BIFAST_INQUIRY_REJECTED"));
+    }
+
+    @Test
+    void bifastInquiryRefusesASourceOutsideTheDebitChainAndANonParticipantBankWithoutCallingUpstream() {
+        stubBiFast();
+
+        assertThatThrownBy(() -> service.bifastInquiry(COMPANY, new BiFastInquiryRequest(
+                "budi", "999", "DB2", "9876543210", new BigDecimal("10000"), "01", null, null)))
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("SOURCE_ACCT_FORBIDDEN"));
+        assertThatThrownBy(() -> service.bifastInquiry(COMPANY, new BiFastInquiryRequest(
+                "budi", SOURCE, "DB1", "9876543210", new BigDecimal("10000"), "01", null, null)))
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("BENEFICIARY_BANK_INVALID"));
+        verify(coreTransferClient, never()).inquireBiFast(any());
+    }
+
+    @Test
+    void detailExposesTheBiFastIdentifiersAndPurpose() {
+        var task = new TrxTaskRows.TaskRow("T1", "REF1", TransferServiceImpl.MENU_CD_BANK_LAIN,
+                TransferType.SRVC_DOM_BIFAST, "EXECUTED", null, new BigDecimal("123999"), "IDR",
+                SOURCE, "9876543210", "TUMPAL YAN RAYMOND TEST", "bayar vendor", "BUDI SANTOSO",
+                java.time.LocalDateTime.now(), 4L, "900067", "20260904100000000042",
+                java.time.LocalDateTime.now(), "DB2", "BANK MANDIRI", "BMRIIDJA", "BMRIIDJA",
+                new BigDecimal("2500"), null, null, null, null, null, null, null, null, null, null,
+                "20250925BNINIDJA01075210687", "20250925BNINIDJA010O0175210687", "01");
+        when(trxTaskMapper.findTask(COMPANY, "T1")).thenReturn(task);
+        when(trxTaskMapper.findActions("T1")).thenReturn(List.of());
+        when(trxTaskMapper.findStages("T1")).thenReturn(List.of());
+
+        var detail = service.detail(COMPANY, "T1", "budi");
+
+        assertThat(detail.transferType()).isEqualTo("BIFAST");
+        assertThat(detail.menuName()).isEqualTo(TransferServiceImpl.MENU_NAME_BANK_LAIN);
+        assertThat(detail.trxId()).isEqualTo("20250925BNINIDJA01075210687");
+        assertThat(detail.endToEndId()).isEqualTo("20250925BNINIDJA010O0175210687");
+        assertThat(detail.transactionPurpose()).isEqualTo("01");
+        assertThat(detail.totalAmount()).isEqualByComparingTo("126499");
     }
 }

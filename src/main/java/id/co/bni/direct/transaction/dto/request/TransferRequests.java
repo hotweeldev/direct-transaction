@@ -75,7 +75,36 @@ public final class TransferRequests {
             String underlyingDocName,
             BigDecimal underlyingDocAmount,
             String underlyingDocExpiry,
-            String inquiryRequestId) {
+            String inquiryRequestId,
+            String transactionPurpose,
+            String proxyType,
+            String proxyValue,
+            @Valid BiFastCreditorRequest bifastCreditor) {
+
+        /** The pre-P7 shape (everything but the BI-Fast purpose, proxy and creditor echo). */
+        public SubmitTransferRequest(String userId, String sourceAccountNo,
+                                     String beneficiaryAccountNo, String beneficiaryName,
+                                     MoneyRequest amount, String remark, OtpRequest otp,
+                                     String transferType, String beneficiaryBankId,
+                                     String beneficiaryAddress1, String beneficiaryAddress2,
+                                     String beneficiaryAddress3, String beneficiaryPhone,
+                                     String beneficiaryPostalCode, String beneficiaryIdType,
+                                     String beneficiaryIdNumber, String beneficiaryType,
+                                     String remitterResidencyCode, String beneficiaryResidencyCode,
+                                     String beneficiaryCurrency, BigDecimal debitAmount,
+                                     String rateType, String underlyingDocType,
+                                     String underlyingDocNumber, String underlyingDocName,
+                                     BigDecimal underlyingDocAmount, String underlyingDocExpiry,
+                                     String inquiryRequestId) {
+            this(userId, sourceAccountNo, beneficiaryAccountNo, beneficiaryName, amount,
+                    remark, otp, transferType, beneficiaryBankId, beneficiaryAddress1,
+                    beneficiaryAddress2, beneficiaryAddress3, beneficiaryPhone,
+                    beneficiaryPostalCode, beneficiaryIdType, beneficiaryIdNumber,
+                    beneficiaryType, remitterResidencyCode, beneficiaryResidencyCode,
+                    beneficiaryCurrency, debitAmount, rateType, underlyingDocType,
+                    underlyingDocNumber, underlyingDocName, underlyingDocAmount,
+                    underlyingDocExpiry, inquiryRequestId, null, null, null, null);
+        }
 
         /** The pre-P3 wire (through the P5 underlying block); no VA inquiry id. */
         public SubmitTransferRequest(String userId, String sourceAccountNo,
@@ -135,6 +164,37 @@ public final class TransferRequests {
      * {@code sourceAccountNo} is forwarded because the VA service keys the inquiry on
      * the paying account too.
      */
+    /**
+     * The creditor block the BI-Fast inquiry answered, echoed back on the submit so the
+     * release-time credit transfer can repeat it verbatim (the switch binds the credit
+     * to the inquiry through these fields). Every field may be null - the switch decides
+     * whether it accepts a credit without them.
+     */
+    public record BiFastCreditorRequest(
+            String id,
+            String type,
+            String accountType,
+            String residentStatus,
+            String townName,
+            String settlementDate) {
+    }
+
+    /**
+     * The BI-Fast beneficiary inquiry (P7): the FE's "Periksa" step. {@code proxyType} /
+     * {@code proxyValue} select the alias route (then {@code beneficiaryAccountNo} may be
+     * blank); otherwise the account route.
+     */
+    public record BiFastInquiryRequest(
+            @NotBlank String userId,
+            @NotBlank String sourceAccountNo,
+            @NotBlank String beneficiaryBankId,
+            String beneficiaryAccountNo,
+            @NotNull @Positive BigDecimal amount,
+            @NotBlank String transactionPurpose,
+            String proxyType,
+            String proxyValue) {
+    }
+
     public record VaInquiryRequest(
             @NotBlank String userId,
             @NotBlank String sourceAccountNo,

@@ -27,7 +27,10 @@
                               LLD_IS_REM_RES, LLD_IS_BEN_RES, FEE_AMT,
                               DEBIT_CCY_CD, DEBIT_AMT, EXCHANGE_RATE, BASE_AMT, RATE_TYPE,
                               SOURCE_PRODUCT_TYPE, ADVISORY_MSG, UND_DOC_TYPE, UND_DOC_NO,
-                              UND_DOC_NM, UND_DOC_AMT, UND_DOC_EXPIRY, VA_INQUIRY_REQ_ID)
+                              UND_DOC_NM, UND_DOC_AMT, UND_DOC_EXPIRY, VA_INQUIRY_REQ_ID,
+                              BIFAST_PURPOSE_CD, BIFAST_CRED_ID, BIFAST_CRED_TYPE,
+                              BIFAST_CRED_ACCT_TYPE, BIFAST_CRED_RSDNT_STS, BIFAST_CRED_TOWN,
+                              BIFAST_SETTLEMENT_DT, PROXY_TYPE, PROXY_ID)
         VALUES (#{id}, #{corpId}, #{menuCd}, #{srvcCd}, #{refNo}, #{status},
                 #{currentStageSeq}, #{remAcctNo}, #{benAcctNo}, #{benAcctNm},
                 #{trxAmt}, #{trxCcyCd}, #{remark1}, #{remark2}, #{remark3},
@@ -39,7 +42,10 @@
                 #{domestic.lldIsRemRes}, #{domestic.lldIsBenRes}, #{domestic.feeAmt},
                 #{cross.debitCcyCd}, #{cross.debitAmt}, #{cross.exchangeRate}, #{cross.baseAmt}, #{cross.rateType},
                 #{cross.sourceProductType}, #{cross.advisoryMsg}, #{cross.undDocType}, #{cross.undDocNo},
-                #{cross.undDocNm}, #{cross.undDocAmt}, #{cross.undDocExpiry}, #{vaInquiryReqId})
+                #{cross.undDocNm}, #{cross.undDocAmt}, #{cross.undDocExpiry}, #{vaInquiryReqId},
+                #{bifast.purposeCd}, #{bifast.credId}, #{bifast.credType},
+                #{bifast.credAcctType}, #{bifast.credRsdntSts}, #{bifast.credTown},
+                #{bifast.settlementDt}, #{bifast.proxyType}, #{bifast.proxyId})
     </insert>
 
     <insert id="insertStage">
@@ -100,7 +106,10 @@
                ADVISORY_MSG      AS "advisoryMsg",
                TWO_LEG_STATE     AS "twoLegState",
                SIMSEM_ACCT_NO    AS "simsemAcctNo",
-               JOURNAL_NO_SIMSEM AS "journalNoSimsem"
+               JOURNAL_NO_SIMSEM AS "journalNoSimsem",
+               TRX_ID            AS "trxId",
+               END_TO_END_ID     AS "endToEndId",
+               BIFAST_PURPOSE_CD AS "bifastPurposeCd"
         FROM TRX_TASK
         WHERE CORP_ID = #{companyId}
           AND ID = #{taskId}
@@ -263,7 +272,16 @@
                BASE_AMT       AS "baseAmt",
                RATE_TYPE      AS "rateType",
                SOURCE_PRODUCT_TYPE AS "sourceProductType",
-               VA_INQUIRY_REQ_ID   AS "vaInquiryReqId"
+               VA_INQUIRY_REQ_ID   AS "vaInquiryReqId",
+               BIFAST_PURPOSE_CD     AS "bifastPurposeCd",
+               BIFAST_CRED_ID        AS "bifastCredId",
+               BIFAST_CRED_TYPE      AS "bifastCredType",
+               BIFAST_CRED_ACCT_TYPE AS "bifastCredAcctType",
+               BIFAST_CRED_RSDNT_STS AS "bifastCredRsdntSts",
+               BIFAST_CRED_TOWN      AS "bifastCredTown",
+               BIFAST_SETTLEMENT_DT  AS "bifastSettlementDt",
+               PROXY_TYPE            AS "proxyType",
+               PROXY_ID              AS "proxyId"
         FROM TRX_TASK
         WHERE ID = #{taskId}
     </select>
@@ -339,6 +357,16 @@
         UPDATE TRX_TASK
         SET RETRIEVAL_REF_NO = #{retrievalRefNo},
             INTERBANK_RESPONSE_CD = #{responseCd},
+            UPDATED_DT = SYSDATE
+        WHERE ID = #{taskId}
+    </update>
+
+    <!-- P7 BI-Fast: the switch identifiers credit-transfer answered. -->
+    <update id="updateBiFastResult">
+        UPDATE TRX_TASK
+        SET TRX_ID = #{trxId},
+            END_TO_END_ID = #{endToEndId},
+            UPDATED_BY = #{updatedBy},
             UPDATED_DT = SYSDATE
         WHERE ID = #{taskId}
     </update>

@@ -93,10 +93,40 @@ class MapperStatementsTest {
                 new TrxTaskRows.DomesticInsert(null, null, null, null, null, null, null, null,
                         null, null, null, null, null, null, java.math.BigDecimal.ZERO),
                 null, "INQ-1");
-        for (Object param : new Object[]{inHouse, domestic, cross, virtualAccount}) {
+        // P7: the BI-Fast shape - domestic block (participant BIC, fee) plus the V10
+        // nested block bound through #{bifast.*}; every earlier shape binds NULLs there.
+        var bifast = new TrxTaskRows.TaskInsert("T5", "CORP1", "MNU", "GCM_FTR_DOM_BIFAST", "REF5",
+                "PENDING_APPROVAL", 1, "111", "9876543210", "NAME", java.math.BigDecimal.ONE,
+                "IDR", null, null, null, "IMMEDIATE", "CU1", "MAKER", "N", "tester",
+                new TrxTaskRows.DomesticInsert("DB2", "BMRIIDJA", "BANK", "BMRIIDJA", null, null, null,
+                        null, null, null, null, null, null, null, new java.math.BigDecimal("2500")),
+                null, null,
+                new TrxTaskRows.BiFastInsert("01", "23231453124123", "01", "SVGS", "01", "0300",
+                        "2026-09-04", null, null));
+        for (Object param : new Object[]{inHouse, domestic, cross, virtualAccount, bifast}) {
             var boundSql = statement.getBoundSql(param);
             var handler = configuration.newParameterHandler(statement, param, boundSql);
             // Throws if any #{...} path (nested or not) cannot be resolved on the records.
+            handler.setParameters(org.mockito.Mockito.mock(java.sql.PreparedStatement.class));
+        }
+    }
+
+    /** insertBaseFtDom binds the P7 identifiers when present and NULLs on every older shape. */
+    @Test
+    void insertBaseFtDomBindsTheBiFastColumnsPresentOrNull() throws Exception {
+        var statement = configuration.getMappedStatement(
+                TransferMapper.class.getName() + ".insertBaseFtDom");
+        var llg = new id.co.bni.direct.transaction.entity.TransferRows.BaseFtDomInsert(
+                "F1", "cls", "MNU", "SRVC", "REF", "TRX", "111", "222", "NAME",
+                java.math.BigDecimal.TEN, "DB1", null, null, null, "1", "1", "1", "CENAIDJA",
+                "CU1", "CU9");
+        var bifast = new id.co.bni.direct.transaction.entity.TransferRows.BaseFtDomInsert(
+                "F2", "cls", "MNU", "SRVC", "REF", "TRX", "111", "222", "NAME",
+                java.math.BigDecimal.TEN, "DB2", null, null, null, null, null, null, "BMRIIDJA",
+                "CU1", "CU9", null, null, "01", "01", null, null, "T-1", "E-1");
+        for (Object param : new Object[]{llg, bifast}) {
+            var boundSql = statement.getBoundSql(param);
+            var handler = configuration.newParameterHandler(statement, param, boundSql);
             handler.setParameters(org.mockito.Mockito.mock(java.sql.PreparedStatement.class));
         }
     }

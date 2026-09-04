@@ -122,6 +122,18 @@ public interface TrxTaskMapper {
                               @Param("retrievalRefNo") String retrievalRefNo,
                               @Param("responseCd") String responseCd);
 
+    // ---- P7: BI-Fast ----
+
+    /**
+     * The switch identifiers credit-transfer answered (trxId, endToEndId), stored on the
+     * task next to the journal so the detail screen needs no BASE_FT join. Not pinned to
+     * a status: written right after the verdict, in the same transaction.
+     */
+    int updateBiFastResult(@Param("taskId") String taskId,
+                           @Param("trxId") String trxId,
+                           @Param("endToEndId") String endToEndId,
+                           @Param("updatedBy") String updatedBy);
+
     // ---- P6: two-leg (simsem) execution ----
 
     /**

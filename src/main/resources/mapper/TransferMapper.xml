@@ -332,6 +332,8 @@
                              BEN_DOM_BNK_ID, BEN_ADDR_1, BEN_ADDR_2, BEN_ADDR_3,
                              LLD_IS_REM_RES, LLD_IS_BEN_RES, BEN_TYPE, BIC_SWIFT_CD,
                              ACCT_NO_SIMSEM, JOURNAL_NO_SIMSEM,
+                             BIFAST_TRX_PURPOSE_CD, BI_FAST_BEN_CD, PROXY_ID, PROXY_TYPE,
+                             TRX_ID, END_TO_END_ID,
                              CREATED_BY, CREATED_DT, UPDATED_BY)
         VALUES (#{id}, #{ftClass}, 1, #{mnuCd},
                 #{srvcCd}, 999, #{refNo}, #{trxRefNo},
@@ -342,6 +344,8 @@
                 #{benDomBnkId}, #{benAddr1}, #{benAddr2}, #{benAddr3},
                 #{lldIsRemRes}, #{lldIsBenRes}, #{benType}, #{bicSwiftCd},
                 #{acctNoSimsem}, #{journalNoSimsem},
+                #{bifastPurposeCd}, #{biFastBenCd}, #{proxyId}, #{proxyType},
+                #{trxId}, #{endToEndId},
                 #{createdBy}, SYSDATE, #{updatedBy})
     </insert>
 
@@ -358,7 +362,8 @@
                CD        AS "cd",
                NM        AS "nm",
                MEMBER_CD AS "memberCd",
-               ONLINE_CD AS "onlineCd"
+               ONLINE_CD AS "onlineCd",
+               BIFAST_CD AS "bifastCd"
         FROM COM_MT_DOM_BANK
         WHERE ID = #{id}
           AND IS_DELETE = N'N'
@@ -372,7 +377,8 @@
                CD        AS "cd",
                NM        AS "nm",
                MEMBER_CD AS "memberCd",
-               ONLINE_CD AS "onlineCd"
+               ONLINE_CD AS "onlineCd",
+               BIFAST_CD AS "bifastCd"
         FROM COM_MT_DOM_BANK
         WHERE IS_DELETE = N'N'
           AND REGEXP_LIKE(CD, '^[0-9]{7}$')
@@ -385,7 +391,8 @@
                CD        AS "cd",
                NM        AS "nm",
                MEMBER_CD AS "memberCd",
-               ONLINE_CD AS "onlineCd"
+               ONLINE_CD AS "onlineCd",
+               BIFAST_CD AS "bifastCd"
         FROM COM_MT_DOM_BANK
         WHERE IS_DELETE = N'N'
           AND (MEMBER_CD IS NOT NULL OR NOT REGEXP_LIKE(CD, '^[0-9]+$'))
@@ -400,7 +407,8 @@
                CD        AS "cd",
                NM        AS "nm",
                MEMBER_CD AS "memberCd",
-               ONLINE_CD AS "onlineCd"
+               ONLINE_CD AS "onlineCd",
+               BIFAST_CD AS "bifastCd"
         FROM COM_MT_DOM_BANK
         WHERE IS_DELETE = N'N'
           AND ONLINE_CD IS NOT NULL
@@ -411,6 +419,41 @@
          _RTGS): VALUE is 'duration|min|max|fee' with IDR-formatted amount tokens, parsed
          leniently in SysParamMethodInfo. Read-only; a missing or soft-deleted row simply
          answers null and the FE hint degrades to the configured fee alone. -->
+    <!-- P7: BI-Fast participants. BIFAST_CD is the receivingBIC the switch routes on
+         (e.g. BMRIIDJA); a bank without one cannot be reached via BI-Fast. -->
+    <select id="findBiFastBanks" resultType="id.co.bni.direct.transaction.entity.TransferRows$DomBankRow">
+        SELECT ID        AS "id",
+               CD        AS "cd",
+               NM        AS "nm",
+               MEMBER_CD AS "memberCd",
+               ONLINE_CD AS "onlineCd",
+               BIFAST_CD AS "bifastCd"
+        FROM COM_MT_DOM_BANK
+        WHERE IS_DELETE = N'N'
+          AND NVL(IS_INACTIVE, N'N') = N'N'
+          AND BIFAST_CD IS NOT NULL
+        ORDER BY NM
+    </select>
+
+    <!-- P7: the transaction purposes the BI-Fast wire mandates (legacy reference table;
+         DEV: 01 Investment, 02 Transfer of Wealth, 03 Purchase, 99 Others). -->
+    <select id="findBiFastPurposes" resultType="id.co.bni.direct.transaction.entity.TransferRows$BiFastPurposeRow">
+        SELECT CD AS "cd",
+               NM AS "nm"
+        FROM COM_MT_BIFAST_TRX_PURPOSE
+        WHERE IS_DELETE = N'N'
+          AND NVL(IS_INACTIVE, N'N') = N'N'
+        ORDER BY IDX, CD
+    </select>
+
+    <select id="countBiFastPurpose" resultType="int">
+        SELECT COUNT(*)
+        FROM COM_MT_BIFAST_TRX_PURPOSE
+        WHERE CD = #{cd}
+          AND IS_DELETE = N'N'
+          AND NVL(IS_INACTIVE, N'N') = N'N'
+    </select>
+
     <select id="findSysParamValue" resultType="string">
         SELECT VALUE
         FROM SYS_PARAM

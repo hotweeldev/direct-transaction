@@ -1,5 +1,6 @@
 package id.co.bni.direct.transaction.service.impl;
 
+import id.co.bni.direct.transaction.dto.request.TransferRequests.BiFastInquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.InquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.InterbankInquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.OtpChallengeRequest;
@@ -7,6 +8,8 @@ import id.co.bni.direct.transaction.dto.request.TransferRequests.SubmitTransferR
 import id.co.bni.direct.transaction.dto.request.TransferRequests.VaInquiryRequest;
 import id.co.bni.direct.transaction.config.TransferTypeProperties;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.BankResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.BiFastInquiryResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.BiFastPurposeResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.InquiryResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.InterbankInquiryResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.MethodInfoResponse;
@@ -16,6 +19,7 @@ import id.co.bni.direct.transaction.dto.response.TransferResponses.SubmitRespons
 import id.co.bni.direct.transaction.dto.response.TransferResponses.TaskDetailResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.VaInquiryResponse;
 import id.co.bni.direct.transaction.entity.TransferRows.BankLimitRow;
+import id.co.bni.direct.transaction.entity.TransferRows.BiFastPurposeRow;
 import id.co.bni.direct.transaction.entity.TransferRows.CorpFlagsRow;
 import id.co.bni.direct.transaction.entity.TransferRows.DomBankRow;
 import id.co.bni.direct.transaction.entity.TransferRows.MakerRow;
@@ -114,6 +118,8 @@ public class TransferServiceImpl implements TransferService {
     public static final String SYS_PARAM_LLG = "SYS_PARAM_TRF_SME_LLG";
     public static final String SYS_PARAM_RTGS = "SYS_PARAM_TRF_SME_RTGS";
     public static final String SYS_PARAM_ONLINE = "SYS_PARAM_TRF_SME_ONLINE";
+    /** P7: the BI-Fast display parameters (duration|min|max|fee) - fee IDR 2,500 on DEV. */
+    public static final String SYS_PARAM_BIFAST = "SYS_PARAM_TRF_SME_BIFAST";
     /**
      * Core banking rate type 02 = Regular (counter rate) - the P5 default. Kurs khusus
      * (SmartForex) is task 5.2, blocked(env); until then the FE's special-rate option
@@ -259,6 +265,7 @@ public class TransferServiceImpl implements TransferService {
         AmountRules.validateScale(amount, currency, "Nominal transfer");
         TrxTaskRows.DomesticInsert domestic = null;
         TrxTaskRows.CrossInsert cross = null;
+        TrxTaskRows.BiFastInsert bifast = null;
         String srvcCd;
         String menuCd;
         if (type.isVirtualAccount()) {
@@ -274,9 +281,12 @@ public class TransferServiceImpl implements TransferService {
             // P6: a valas source account on LLG/RTGS freezes the same V7 block P5 uses;
             // execution then routes through a simsem account in two legs.
             cross = resolveDomesticCross(type, request, amount);
+            // P7: BI-Fast freezes the purpose and the creditor block its inquiry answered.
+            bifast = type.isBiFast() ? resolveBiFast(request) : null;
             srvcCd = switch (type) {
                 case LLG -> TransferType.SRVC_DOM_LLG;
                 case RTGS -> TransferType.SRVC_DOM_RTGS;
+                case BIFAST -> TransferType.SRVC_DOM_BIFAST;
                 default -> TransferType.SRVC_DOM_ONLINE;
             };
             menuCd = MENU_CD_BANK_LAIN;
@@ -451,7 +461,8 @@ public class TransferServiceImpl implements TransferService {
                 actor,
                 domestic,
                 cross,
-                type.isVirtualAccount() ? trimTo(request.inquiryRequestId(), 64) : null));
+                type.isVirtualAccount() ? trimTo(request.inquiryRequestId(), 64) : null,
+                bifast));
 
         if (!singleUser) {
             int seq = 1;
@@ -606,7 +617,8 @@ public class TransferServiceImpl implements TransferService {
                 task.retrievalRefNo(), task.interbankResponseCd(),
                 task.debitCcyCd(), task.debitAmt(), task.exchangeRate(),
                 task.advisoryMsg(), task.sourceProductType(),
-                task.twoLegState(), task.simsemAcctNo(), task.journalNoSimsem());
+                task.twoLegState(), task.simsemAcctNo(), task.journalNoSimsem(),
+                task.trxId(), task.endToEndId(), task.bifastPurposeCd());
     }
 
     @Override
@@ -614,11 +626,12 @@ public class TransferServiceImpl implements TransferService {
         TransferType type = parseType(method);
         if (!type.isDomestic()) {
             throw new BusinessRuleException("TRANSFER_FIELDS_INVALID",
-                    "Parameter method harus LLG, RTGS, atau ONLINE.");
+                    "Parameter method harus LLG, RTGS, ONLINE, atau BIFAST.");
         }
         List<DomBankRow> rows = switch (type) {
             case LLG -> transferMapper.findClearingBanks();
             case RTGS -> transferMapper.findRtgsBanks();
+            case BIFAST -> transferMapper.findBiFastBanks();
             default -> transferMapper.findOnlineBanks();
         };
         // ONLINE routes by the 3-digit interbank code alone - no BIC on that wire.
@@ -626,6 +639,8 @@ public class TransferServiceImpl implements TransferService {
                 .map(bank -> switch (type) {
                     case LLG -> new BankResponse(bank.id(), bank.cd(), bank.nm(), bic8(bank.memberCd()));
                     case RTGS -> new BankResponse(bank.id(), rtgsBic(bank), bank.nm(), rtgsBic(bank));
+                    // BI-Fast routes on BIFAST_CD, the participant BIC (e.g. BMRIIDJA).
+                    case BIFAST -> new BankResponse(bank.id(), bank.bifastCd(), bank.nm(), bank.bifastCd());
                     default -> new BankResponse(bank.id(), bank.onlineCd(), bank.nm(), null);
                 })
                 .toList();
@@ -636,11 +651,12 @@ public class TransferServiceImpl implements TransferService {
         TransferType type = parseType(method);
         if (!type.isDomestic()) {
             throw new BusinessRuleException("TRANSFER_FIELDS_INVALID",
-                    "Parameter method harus LLG, RTGS, atau ONLINE.");
+                    "Parameter method harus LLG, RTGS, ONLINE, atau BIFAST.");
         }
         String cd = switch (type) {
             case LLG -> SYS_PARAM_LLG;
             case RTGS -> SYS_PARAM_RTGS;
+            case BIFAST -> SYS_PARAM_BIFAST;
             default -> SYS_PARAM_ONLINE;
         };
         SysParamMethodInfo info = SysParamMethodInfo.parse(transferMapper.findSysParamValue(cd));
@@ -717,6 +733,112 @@ public class TransferServiceImpl implements TransferService {
                 inquiry.responseMessage());
     }
 
+    @Override
+    public List<BiFastPurposeResponse> bifastPurposes(String companyId) {
+        return transferMapper.findBiFastPurposes().stream()
+                .map(row -> new BiFastPurposeResponse(row.cd(), row.nm()))
+                .toList();
+    }
+
+    /**
+     * The BI-Fast beneficiary inquiry (P7) - the FE's "Periksa" step before a BIFAST
+     * submit. The switch prices the inquiry on the paying account, amount and fee, so the
+     * caller must hold debit rights on the source (the chain the submit checks) and the
+     * fee sent is the same flat fee the submit will freeze. The creditor block the switch
+     * answers is handed back for the FE to echo as {@code bifastCreditor}. The reference
+     * is minted in the TRX_REF_NO shape with a random tail - never the booking counter.
+     */
+    @Override
+    public BiFastInquiryResponse bifastInquiry(String companyId, BiFastInquiryRequest request) {
+        MakerRow user = transferMapper.findMaker(companyId, request.userId());
+        if (user == null) {
+            throw new NotFoundException("Pengguna tidak ditemukan.");
+        }
+        if (user.acctGroupId() == null
+                || transferMapper.countDebitAccount(user.acctGroupId(), request.sourceAccountNo()) == 0) {
+            throw new BusinessRuleException("SOURCE_ACCT_FORBIDDEN",
+                    "Rekening sumber tidak tersedia untuk didebit oleh pengguna ini.");
+        }
+        DomBankRow bank = transferMapper.findDomBank(request.beneficiaryBankId().trim());
+        String bifastCd = bank == null ? null : bifastCd(bank);
+        if (bifastCd == null) {
+            throw new BusinessRuleException("BENEFICIARY_BANK_INVALID",
+                    "Bank penerima tidak ditemukan atau bukan peserta BI-Fast.");
+        }
+        String purpose = validateBiFastPurpose(request.transactionPurpose());
+        boolean proxy = !isBlank(request.proxyValue());
+        if (!proxy && isBlank(request.beneficiaryAccountNo())) {
+            throw new BusinessRuleException("TRANSFER_FIELDS_INVALID",
+                    "Nomor rekening penerima atau proxy BI-Fast wajib diisi.");
+        }
+        AmountRules.validateScale(request.amount(), "IDR", "Nominal transfer");
+        BigDecimal fee = bifastFee();
+        CoreTransferClient.BiFastInquiry inquiry = coreTransferClient.inquireBiFast(
+                new CoreTransferClient.BiFastInquiryInstruction(
+                        inquiryRefNo(), request.sourceAccountNo(),
+                        CoreTransferClient.amountString(request.amount()),
+                        CoreTransferClient.amountString(fee),
+                        bifastCd,
+                        proxy ? null : request.beneficiaryAccountNo().trim(),
+                        proxy ? trimTo(request.proxyType(), 20) : null,
+                        proxy ? trimTo(request.proxyValue(), 100) : null,
+                        purpose));
+        return new BiFastInquiryResponse(
+                inquiry.creditorName(), bifastCd,
+                inquiry.creditorId(), inquiry.creditorType(), inquiry.creditorAccountType(),
+                inquiry.creditorResidentStatus(), inquiry.creditorTownName(),
+                inquiry.settlementDate(), fee, request.amount());
+    }
+
+    /**
+     * The V10 block frozen at submit (P7): the validated purpose, the creditor identity the
+     * inquiry answered (echoed as sent - the switch, not this service, decides whether a
+     * credit without it is acceptable), and the proxy route when one was used.
+     */
+    private TrxTaskRows.BiFastInsert resolveBiFast(SubmitTransferRequest request) {
+        var creditor = request.bifastCreditor();
+        boolean proxy = !isBlank(request.proxyValue());
+        return new TrxTaskRows.BiFastInsert(
+                request.transactionPurpose().trim(),
+                creditor == null ? null : trimTo(creditor.id(), 40),
+                creditor == null ? null : trimTo(creditor.type(), 10),
+                creditor == null ? null : trimTo(creditor.accountType(), 10),
+                creditor == null ? null : trimTo(creditor.residentStatus(), 10),
+                creditor == null ? null : trimTo(creditor.townName(), 40),
+                creditor == null ? null : trimTo(creditor.settlementDate(), 20),
+                proxy ? trimTo(request.proxyType(), 20) : null,
+                proxy ? trimTo(request.proxyValue(), 100) : null);
+    }
+
+    /** The trimmed purpose code, or the 422 when it is not an active legacy code. */
+    private String validateBiFastPurpose(String purpose) {
+        if (isBlank(purpose)) {
+            throw new BusinessRuleException("BIFAST_PURPOSE_INVALID",
+                    "Tujuan transaksi BI-Fast wajib dipilih.");
+        }
+        String cd = purpose.trim();
+        if (transferMapper.countBiFastPurpose(cd) == 0) {
+            throw new BusinessRuleException("BIFAST_PURPOSE_INVALID",
+                    "Tujuan transaksi BI-Fast tidak dikenal atau tidak aktif.");
+        }
+        return cd;
+    }
+
+    /** The flat BI-Fast fee: the SYS_PARAM row's fee token, else the configured fallback. */
+    private BigDecimal bifastFee() {
+        BigDecimal fee = SysParamMethodInfo.parse(transferMapper.findSysParamValue(SYS_PARAM_BIFAST)).fee();
+        if (fee == null) {
+            fee = transferTypeProperties.getBifast().getFee();
+        }
+        return fee != null ? fee : BigDecimal.ZERO;
+    }
+
+    /** The bank row's BI-Fast participant BIC, or null when it cannot be reached via BI-Fast. */
+    private static String bifastCd(DomBankRow bank) {
+        String cd = bank.bifastCd() == null ? null : bank.bifastCd().trim();
+        return cd == null || cd.isEmpty() ? null : cd;
+    }
+
     /**
      * The VA block frozen at submit (P3): IDR only (the VA billing wire carries no
      * currency), a VA number in the legacy format, and the flat VA fee on FEE_AMT. The
@@ -778,6 +900,7 @@ public class TransferServiceImpl implements TransferService {
             case LLG -> transferTypeProperties.getLlg();
             case RTGS -> transferTypeProperties.getRtgs();
             case ONLINE -> transferTypeProperties.getOnline();
+            case BIFAST -> transferTypeProperties.getBifast();
             default -> throw new IllegalArgumentException(type.name());
         };
     }
@@ -837,6 +960,21 @@ public class TransferServiceImpl implements TransferService {
                     bank.id(), onlineCd, bank.nm(), null,
                     null, null, null, null, null, null, null, null, null, null,
                     onlineFee != null ? onlineFee : BigDecimal.ZERO);
+        }
+        if (type == TransferType.BIFAST) {
+            // P7: the participant BIC is the only routing code; the address/id block is
+            // not on the BI-Fast wire (the creditor identity comes from the inquiry,
+            // frozen separately in the V10 block), so anything sent there is ignored.
+            String bifastCd = bifastCd(bank);
+            if (bifastCd == null) {
+                throw new BusinessRuleException("BENEFICIARY_BANK_INVALID",
+                        "Bank yang dipilih bukan peserta BI-Fast; pilih bank dari daftar BI-Fast.");
+            }
+            validateBiFastPurpose(request.transactionPurpose());
+            return new TrxTaskRows.DomesticInsert(
+                    bank.id(), bifastCd, bank.nm(), bifastCd,
+                    null, null, null, null, null, null, null, null, null, null,
+                    bifastFee());
         }
         String bankCode;
         String bic;
@@ -921,9 +1059,9 @@ public class TransferServiceImpl implements TransferService {
             // Same currency: the P1/P2 shape, nothing frozen.
             return null;
         }
-        if (type == TransferType.ONLINE) {
+        if (type == TransferType.ONLINE || type == TransferType.BIFAST) {
             throw new BusinessRuleException("TRANSFER_FIELDS_INVALID",
-                    "Transfer Online/ATM Bersama hanya tersedia dari rekening sumber IDR; "
+                    "Transfer Online/ATM Bersama dan BI-Fast hanya tersedia dari rekening sumber IDR; "
                             + "gunakan LLG atau RTGS untuk rekening valas.");
         }
         BigDecimal debitAmt = request.debitAmount();

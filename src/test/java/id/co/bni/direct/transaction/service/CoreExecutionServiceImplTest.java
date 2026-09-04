@@ -13,6 +13,7 @@ import id.co.bni.direct.transaction.entity.TransferRows.UsageLockRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ActionInsert;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ExecutionTaskRow;
 import id.co.bni.direct.transaction.integration.CoreTransferClient;
+import id.co.bni.direct.transaction.integration.CoreTransferClient.BiFastOutcome;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.Status;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.TransferOutcome;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
@@ -1113,6 +1114,149 @@ class CoreExecutionServiceImplTest {
 
         assertThat(result.status()).isEqualTo("UNKNOWN");
         assertThat(result.message()).contains("907409");
+        verify(trxTaskMapper, never()).markExecuted(anyString(), anyString(), anyString(), anyString());
+    }
+
+
+    // ---- P7: Transfer ke Bank Lain via BI-Fast ----
+
+    private static final BigDecimal BIFAST_AMOUNT = new BigDecimal("123999");
+
+    /** A BI-Fast task: participant BIC as bank code and BIC, no address block, the V10 block. */
+    private static ExecutionTaskRow bifastTask() {
+        return new ExecutionTaskRow(TASK, "CORP1", "MNU_GCME_050300", "GCM_FTR_DOM_BIFAST",
+                "20260831100000228541", "READY_TO_EXECUTE", "113179933", "9876543210",
+                "TUMPAL YAN RAYMOND TEST", BIFAST_AMOUNT, "IDR", "bayar vendor", "CU1", 3L,
+                "DB2", "BMRIIDJA", "BMRIIDJA",
+                null, null, null, null, null, null, null, null,
+                null, null,
+                new BigDecimal("2500"),
+                null, null, null, null, null,
+                null,
+                "01", "23231453124123", "01", "SVGS", "01", "0300", "2026-09-04",
+                null, null);
+    }
+
+    private void stubClaimableBiFast() {
+        when(trxTaskMapper.findTaskForExecution(TASK)).thenReturn(bifastTask());
+        when(trxTaskMapper.claimExecution(TASK, 3L, "CU1")).thenReturn(1);
+        when(trxTaskMapper.findReleaseActorId(TASK)).thenReturn("CU9");
+        when(transferMapper.lockCorpLimit("CORP1", "GCM_FTR_DOM_BIFAST", "IDR"))
+                .thenReturn(new UsageLockRow("CL1", BigDecimal.ZERO, new BigDecimal("2000000000")));
+        when(transferMapper.findUserGroupId("CU1")).thenReturn("GRP1");
+        when(transferMapper.lockGroupLimit("GRP1", "GCM_FTR_DOM_BIFAST", "IDR"))
+                .thenReturn(new UsageLockRow("GL1", BigDecimal.ZERO, new BigDecimal("1500000000")));
+        when(transferMapper.lockRefNoValue("GCM_FTR_DOM_BIFAST", "CORP1")).thenReturn(41L);
+    }
+
+    private static BiFastOutcome bifast(Status status, String journal, String message) {
+        return new BiFastOutcome(new TransferOutcome(status, journal, message),
+                status == Status.REFUSED ? null : "20250925BNINIDJA01075210687",
+                status == Status.REFUSED ? null : "20250925BNINIDJA010O0175210687");
+    }
+
+    @Test
+    void aBiFastTaskCreditsTheSwitchAndBooksBaseFtWithTheSwitchIdentifiers() {
+        stubClaimableBiFast();
+        when(coreTransferClient.transferBiFast(any())).thenReturn(bifast(Status.SUCCESS, "900067", "OK"));
+
+        var result = service.execute(TASK);
+
+        assertThat(result.status()).isEqualTo("EXECUTED");
+        verify(coreTransferClient, never()).transferKliring(any());
+        verify(coreTransferClient, never()).transferInterbank(any());
+        ArgumentCaptor<CoreTransferClient.BiFastInstruction> sent =
+                ArgumentCaptor.forClass(CoreTransferClient.BiFastInstruction.class);
+        verify(coreTransferClient).transferBiFast(sent.capture());
+        assertThat(sent.getValue().reference()).isEqualTo("20260831100000228541");
+        assertThat(sent.getValue().fromAccount()).isEqualTo("113179933");
+        assertThat(sent.getValue().toAccount()).isEqualTo("9876543210");
+        assertThat(sent.getValue().amount()).isEqualTo("123999.00");
+        assertThat(sent.getValue().fee()).isEqualTo("2500.00");
+        assertThat(sent.getValue().receivingBic()).isEqualTo("BMRIIDJA");
+        assertThat(sent.getValue().creditorName()).isEqualTo("TUMPAL YAN RAYMOND TEST");
+        assertThat(sent.getValue().creditorId()).isEqualTo("23231453124123");
+        assertThat(sent.getValue().creditorType()).isEqualTo("01");
+        assertThat(sent.getValue().creditorAccountType()).isEqualTo("SVGS");
+        assertThat(sent.getValue().creditorResidentStatus()).isEqualTo("01");
+        assertThat(sent.getValue().creditorTownName()).isEqualTo("0300");
+        assertThat(sent.getValue().settlementDate()).isEqualTo("2026-09-04");
+        assertThat(sent.getValue().transactionPurpose()).isEqualTo("01");
+        assertThat(sent.getValue().description()).isEqualTo("bayar vendor");
+        assertThat(sent.getValue().proxyValue()).isNull();
+
+        // Usage moves by amount + fee like every flat-fee domestic type.
+        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("126499"));
+        verify(transferMapper).incrementGroupLimitUsage("GL1", new BigDecimal("126499"));
+
+        ArgumentCaptor<BaseFtDomInsert> row = ArgumentCaptor.forClass(BaseFtDomInsert.class);
+        verify(transferMapper).insertBaseFtDom(row.capture());
+        verify(transferMapper, never()).insertBaseFt(any());
+        assertThat(row.getValue().ftClass()).isEqualTo("com.aprisma.product.gcm.common.model.BIFastFT");
+        assertThat(row.getValue().srvcCd()).isEqualTo("GCM_FTR_DOM_BIFAST");
+        assertThat(row.getValue().benDomBnkId()).isEqualTo("DB2");
+        assertThat(row.getValue().bicSwiftCd()).isEqualTo("BMRIIDJA");
+        assertThat(row.getValue().bifastPurposeCd()).isEqualTo("01");
+        assertThat(row.getValue().biFastBenCd()).isEqualTo("01");
+        assertThat(row.getValue().trxId()).isEqualTo("20250925BNINIDJA01075210687");
+        assertThat(row.getValue().endToEndId()).isEqualTo("20250925BNINIDJA010O0175210687");
+        assertThat(row.getValue().trxRefNo()).hasSize(20).endsWith("000042");
+        assertThat(row.getValue().acctNoSimsem()).isNull();
+
+        verify(trxTaskMapper).markExecuted(eq(TASK), eq("900067"), anyString(), eq("CU9"));
+        verify(trxTaskMapper).updateBiFastResult(TASK, "20250925BNINIDJA01075210687",
+                "20250925BNINIDJA010O0175210687", "CU9");
+        ArgumentCaptor<ActionInsert> action = ArgumentCaptor.forClass(ActionInsert.class);
+        verify(trxTaskMapper).insertAction(action.capture());
+        assertThat(action.getValue().note()).contains("900067").contains("20250925BNINIDJA01075210687");
+        verify(txManager, times(2)).commit(any());
+        verify(txManager, never()).rollback(any());
+    }
+
+    @Test
+    void aRefusedBiFastCreditRollsTheIncrementsBackAndLandsFailedWithTheSwitchMessage() {
+        stubClaimableBiFast();
+        when(coreTransferClient.transferBiFast(any()))
+                .thenReturn(bifast(Status.REFUSED, null, "(SOA) ACCOUNT NOT ABLE TO DO TRANSACTION"));
+
+        var result = service.execute(TASK);
+
+        assertThat(result.status()).isEqualTo("FAILED");
+        assertThat(result.message()).contains("ACCOUNT NOT ABLE TO DO TRANSACTION");
+        verify(txManager).rollback(any());
+        verify(transferMapper, never()).insertBaseFtDom(any());
+        verify(trxTaskMapper, never()).markExecuted(anyString(), anyString(), anyString(), anyString());
+        verify(trxTaskMapper, never()).updateBiFastResult(anyString(), any(), any(), anyString());
+        verify(trxTaskMapper).markExecutionOutcome(TASK, "FAILED", "CU9");
+    }
+
+    @Test
+    void anUnansweredBiFastCreditLandsUnknownKeepsTheUsageAndPinsAnyIdentifiersTheSwitchAnswered() {
+        stubClaimableBiFast();
+        when(coreTransferClient.transferBiFast(any()))
+                .thenReturn(bifast(Status.UNKNOWN, null, "Core banking tidak menjawab tepat waktu."));
+
+        var result = service.execute(TASK);
+
+        assertThat(result.status()).isEqualTo("UNKNOWN");
+        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("126499"));
+        verify(txManager, never()).rollback(any());
+        verify(transferMapper, never()).insertBaseFtDom(any());
+        verify(trxTaskMapper).updateBiFastResult(TASK, "20250925BNINIDJA01075210687",
+                "20250925BNINIDJA010O0175210687", "CU9");
+        verify(trxTaskMapper).markExecutionOutcome(TASK, "UNKNOWN", "CU9");
+    }
+
+    @Test
+    void aBookkeepingFailureAfterTheBiFastCreditLandsUnknownWithTheJournal() {
+        stubClaimableBiFast();
+        when(coreTransferClient.transferBiFast(any())).thenReturn(bifast(Status.SUCCESS, "900067", "OK"));
+        when(transferMapper.insertBaseFtDom(any())).thenThrow(new RuntimeException("ORA-00001"));
+
+        var result = service.execute(TASK);
+
+        assertThat(result.status()).isEqualTo("UNKNOWN");
+        assertThat(result.message()).contains("900067");
         verify(trxTaskMapper, never()).markExecuted(anyString(), anyString(), anyString(), anyString());
     }
 }
