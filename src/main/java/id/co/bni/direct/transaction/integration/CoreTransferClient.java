@@ -268,7 +268,24 @@ public class CoreTransferClient {
      */
     public record VaInquiry(String billingNumber, String inquiryRequestId, String billingName,
                             BigDecimal billedAmount, String currency,
-                            String responseCode, String responseMessage) {
+                            String responseCode, String responseMessage,
+                            String virtualAccountNumber, String virtualAccountName,
+                            String virtualAccountTrxType, String billingLabel, String vaNameLabel,
+                            String billedAmountLabel, String billedAmountValue,
+                            BigDecimal feeAmount, String feeAmountLabel, String feeAmountValue,
+                            String accountNumberTo, String trxId, String clientId,
+                            String additionalLabel1, String additionalLabel2, String additionalLabel3,
+                            String additionalValue1, String additionalValue2, String additionalValue3) {
+
+        /** The pre-bill-block shape (name, amount, ids only). */
+        public VaInquiry(String billingNumber, String inquiryRequestId, String billingName,
+                         BigDecimal billedAmount, String currency,
+                         String responseCode, String responseMessage) {
+            this(billingNumber, inquiryRequestId, billingName, billedAmount, currency,
+                    responseCode, responseMessage,
+                    null, null, null, null, null, null, null, null, null, null, null, null, null,
+                    null, null, null, null, null, null);
+        }
     }
 
     /**
@@ -458,16 +475,42 @@ public class CoreTransferClient {
                     "Layanan inquiry Virtual Account menjawab dengan format yang tidak dikenal.");
         }
         String number = data.path("billingNumber").asText(null);
+        String billingName = blankToNull(data.path("billingName").asText(null));
+        String vaName = blankToNull(data.path("virtualAccountName").asText(null));
         return new VaInquiry(
                 number != null ? number : billingNumber,
-                data.path("inquiryRequestId").asText(null),
-                data.path("billingName").asText(null),
+                blankToNull(data.path("inquiryRequestId").asText(null)),
+                billingName != null ? billingName : vaName,
                 parseAmount(data.path("billedAmount").isObject()
                         ? data.path("billedAmount").path("amount").asText(null)
                         : data.path("billedAmount").asText(null)),
                 data.path("currency").asText(null),
                 data.path("responseCode").asText(null),
-                data.path("responseMessage").asText(null));
+                data.path("responseMessage").asText(null),
+                blankToNull(data.path("virtualAccountNumber").asText(null)),
+                vaName,
+                blankToNull(data.path("virtualAccountTrxType").asText(null)),
+                blankToNull(data.path("billingLabel").asText(null)),
+                blankToNull(data.path("vaNameLabel").asText(null)),
+                blankToNull(data.path("billedAmountLabel").asText(null)),
+                blankToNull(data.path("billedAmountValue").asText(null)),
+                parseAmount(data.path("feeAmount").asText(null)),
+                blankToNull(data.path("feeAmountLabel").asText(null)),
+                blankToNull(data.path("feeAmountValue").asText(null)),
+                blankToNull(data.path("accountNumberTo").asText(null)),
+                blankToNull(data.path("trxId").asText(null)),
+                blankToNull(data.path("clientId").asText(null)),
+                blankToNull(data.path("additionalLabel1").asText(null)),
+                blankToNull(data.path("additionalLabel2").asText(null)),
+                blankToNull(data.path("additionalLabel3").asText(null)),
+                blankToNull(data.path("additionalValue1").asText(null)),
+                blankToNull(data.path("additionalValue2").asText(null)),
+                blankToNull(data.path("additionalValue3").asText(null)));
+    }
+
+    /** The VA service answers absent fields as {@code ""}; read those as null. */
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
     }
 
     /** One attempt at an outward RTGS transfer. Never retried. */

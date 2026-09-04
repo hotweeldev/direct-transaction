@@ -39,7 +39,23 @@ public final class TrxTaskRows {
             DomesticInsert domestic,
             CrossInsert cross,
             String vaInquiryReqId,
-            BiFastInsert bifast) {
+            BiFastInsert bifast,
+            String vaBillJson) {
+
+        /** The pre-V11 shape (everything but the frozen VA bill block). */
+        public TaskInsert(String id, String corpId, String menuCd, String srvcCd,
+                          String refNo, String status, Integer currentStageSeq,
+                          String remAcctNo, String benAcctNo, String benAcctNm,
+                          BigDecimal trxAmt, String trxCcyCd, String remark1,
+                          String remark2, String remark3, String instructionMode,
+                          String makerUserId, String makerUserName, String isSingleUser,
+                          String createdBy, DomesticInsert domestic, CrossInsert cross,
+                          String vaInquiryReqId, BiFastInsert bifast) {
+            this(id, corpId, menuCd, srvcCd, refNo, status, currentStageSeq, remAcctNo,
+                    benAcctNo, benAcctNm, trxAmt, trxCcyCd, remark1, remark2, remark3,
+                    instructionMode, makerUserId, makerUserName, isSingleUser, createdBy,
+                    domestic, cross, vaInquiryReqId, bifast, null);
+        }
 
         /** The pre-P7 shape (everything but the V10 BI-Fast block). */
         public TaskInsert(String id, String corpId, String menuCd, String srvcCd,
@@ -246,7 +262,30 @@ public final class TrxTaskRows {
             String journalNoSimsem,
             String trxId,
             String endToEndId,
-            String bifastPurposeCd) {
+            String bifastPurposeCd,
+            String vaBillJson) {
+
+        /** The pre-V11 shape (everything but the frozen VA bill block). */
+        public TaskRow(String id, String refNo, String menuCd, String srvcCd,
+                       String status, Integer currentStageSeq, BigDecimal trxAmt,
+                       String trxCcyCd, String remAcctNo, String benAcctNo,
+                       String benAcctNm, String remark1, String makerUserName,
+                       LocalDateTime createdDt, Long version, String coreJournal,
+                       String trxRefNo, LocalDateTime executedDt, String benDomBnkId,
+                       String benBnkNm, String benBnkCd, String benBnkBic,
+                       BigDecimal feeAmt, String retrievalRefNo, String interbankResponseCd,
+                       String debitCcyCd, BigDecimal debitAmt, BigDecimal exchangeRate,
+                       String sourceProductType, String advisoryMsg, String twoLegState,
+                       String simsemAcctNo, String journalNoSimsem, String trxId,
+                       String endToEndId, String bifastPurposeCd) {
+            this(id, refNo, menuCd, srvcCd, status, currentStageSeq, trxAmt, trxCcyCd,
+                    remAcctNo, benAcctNo, benAcctNm, remark1, makerUserName, createdDt,
+                    version, coreJournal, trxRefNo, executedDt, benDomBnkId, benBnkNm,
+                    benBnkCd, benBnkBic, feeAmt, retrievalRefNo, interbankResponseCd,
+                    debitCcyCd, debitAmt, exchangeRate, sourceProductType, advisoryMsg,
+                    twoLegState, simsemAcctNo, journalNoSimsem, trxId, endToEndId,
+                    bifastPurposeCd, null);
+        }
 
         /** The pre-P7 shape - everything but the BI-Fast identifiers and purpose. */
         public TaskRow(String id, String refNo, String menuCd, String srvcCd,
@@ -265,7 +304,7 @@ public final class TrxTaskRows {
                     version, coreJournal, trxRefNo, executedDt, benDomBnkId, benBnkNm,
                     benBnkCd, benBnkBic, feeAmt, retrievalRefNo, interbankResponseCd,
                     debitCcyCd, debitAmt, exchangeRate, sourceProductType, advisoryMsg,
-                    twoLegState, simsemAcctNo, journalNoSimsem, null, null, null);
+                    twoLegState, simsemAcctNo, journalNoSimsem, null, null, null, null);
         }
 
         /**
@@ -290,7 +329,7 @@ public final class TrxTaskRows {
                     remAcctNo, benAcctNo, benAcctNm, remark1, makerUserName, createdDt,
                     version, coreJournal, trxRefNo, executedDt, benDomBnkId, benBnkNm,
                     benBnkCd, benBnkBic, feeAmt, retrievalRefNo, interbankResponseCd,
-                    null, null, null, null, null, null, null, null, null, null, null);
+                    null, null, null, null, null, null, null, null, null, null, null, null);
         }
     }
 
@@ -343,7 +382,35 @@ public final class TrxTaskRows {
             String bifastCredTown,
             String bifastSettlementDt,
             String proxyType,
-            String proxyId) {
+            String proxyId,
+            String vaBillJson) {
+
+        /** The pre-V11 shape (everything but the frozen VA bill block). */
+        public ExecutionTaskRow(String id, String corpId, String menuCd, String srvcCd,
+                                String refNo, String status, String remAcctNo,
+                                String benAcctNo, String benAcctNm, BigDecimal trxAmt,
+                                String trxCcyCd, String remark1, String makerUserId,
+                                Long version, String benDomBnkId, String benBnkCd,
+                                String benBnkBic, String benAddr1, String benAddr2,
+                                String benAddr3, String benPhone, String benPostalCd,
+                                String benIdType, String benIdNo, String benType,
+                                String lldIsRemRes, String lldIsBenRes, BigDecimal feeAmt,
+                                String debitCcyCd, BigDecimal debitAmt, BigDecimal baseAmt,
+                                String rateType, String sourceProductType, String vaInquiryReqId,
+                                String bifastPurposeCd, String bifastCredId, String bifastCredType,
+                                String bifastCredAcctType, String bifastCredRsdntSts,
+                                String bifastCredTown, String bifastSettlementDt,
+                                String proxyType, String proxyId) {
+            this(id, corpId, menuCd, srvcCd, refNo, status, remAcctNo, benAcctNo,
+                    benAcctNm, trxAmt, trxCcyCd, remark1, makerUserId, version,
+                    benDomBnkId, benBnkCd, benBnkBic, benAddr1, benAddr2, benAddr3,
+                    benPhone, benPostalCd, benIdType, benIdNo, benType, lldIsRemRes,
+                    lldIsBenRes, feeAmt, debitCcyCd, debitAmt, baseAmt, rateType,
+                    sourceProductType, vaInquiryReqId,
+                    bifastPurposeCd, bifastCredId, bifastCredType, bifastCredAcctType,
+                    bifastCredRsdntSts, bifastCredTown, bifastSettlementDt, proxyType, proxyId,
+                    null);
+        }
 
         /** The pre-P7 shape (everything but the V10 BI-Fast block). */
         public ExecutionTaskRow(String id, String corpId, String menuCd, String srvcCd,
@@ -363,7 +430,7 @@ public final class TrxTaskRows {
                     benPhone, benPostalCd, benIdType, benIdNo, benType, lldIsRemRes,
                     lldIsBenRes, feeAmt, debitCcyCd, debitAmt, baseAmt, rateType,
                     sourceProductType, vaInquiryReqId,
-                    null, null, null, null, null, null, null, null, null);
+                    null, null, null, null, null, null, null, null, null, null);
         }
 
         /** The pre-P3 shape (everything but the V9 VA inquiry id). */

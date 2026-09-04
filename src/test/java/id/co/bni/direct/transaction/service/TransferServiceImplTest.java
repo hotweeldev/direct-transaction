@@ -47,6 +47,8 @@ import id.co.bni.direct.transaction.dto.request.TransferRequests.BiFastCreditorR
 import id.co.bni.direct.transaction.dto.request.TransferRequests.BiFastInquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.VaInquiryRequest;
 import id.co.bni.direct.transaction.exception.NotFoundException;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.VaBillRequest;
+import id.co.bni.direct.transaction.service.VaBill;
 
 /**
  * Mock the mappers and both clients, drive the submit pipeline, assert on the wire shape
@@ -1703,5 +1705,154 @@ class TransferServiceImplTest {
         assertThat(detail.endToEndId()).isEqualTo("20250925BNINIDJA010O0175210687");
         assertThat(detail.transactionPurpose()).isEqualTo("01");
         assertThat(detail.totalAmount()).isEqualByComparingTo("126499");
+    }
+
+    // ---- V11: the VA bill block ----
+
+    private static VaBillRequest openBill(String feeAmount) {
+        return new VaBillRequest("o", "No.VA", "Nama", "Minimum Bayar", "OPEN PAYMENT",
+                BigDecimal.ZERO, "Biaya admin", "Rp" + feeAmount, new BigDecimal(feeAmount),
+                null, "1496387780", "320", null, null, null, null, null, null);
+    }
+
+    private static VaBillRequest fixedBill(String billedAmount, String feeAmount) {
+        return new VaBillRequest("c", "No.VA", "Nama", "Nominal", "Rp" + billedAmount,
+                new BigDecimal(billedAmount), "Biaya admin", "Rp" + feeAmount,
+                new BigDecimal(feeAmount), "1000665901", "1496387781", "320",
+                "Periode", null, null, "2026-09", null, null);
+    }
+
+    private static SubmitTransferRequest vaRequestWithBill(String amount, VaBillRequest bill) {
+        return new SubmitTransferRequest("budi", SOURCE, VA_NUMBER, "PT TOKOPEDIA",
+                new MoneyRequest(new BigDecimal(amount), "IDR"), "bayar tagihan",
+                new OtpRequest("CH-1", "123456"),
+                "VA", null, null, null, null, null, null,
+                null, null, null, null, null,
+                null, null, null, null, null, null, null, null,
+                null, null, null, null, null, bill);
+    }
+
+    @Test
+    void vaInquiryAnswersTheOpenFixedFlagTheServiceFeeAndTheBillBlock() {
+        stubHappyPath();
+        var props = new TransferTypeProperties();
+        props.getVa().setFee(new BigDecimal("3000"));
+        service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                accountNameClient, coreTransferClient, authenticatorClient,
+                executionService, executionOutbox, props,
+                mock(PlatformTransactionManager.class));
+        when(coreTransferClient.inquireVa(anyString(), eq(VA_NUMBER), eq(SOURCE)))
+                .thenReturn(new CoreTransferClient.VaInquiry(VA_NUMBER, null, "test66666",
+                        BigDecimal.ZERO, null, "000", "Success",
+                        VA_NUMBER, "test66666", "o", "No.VA", "Nama",
+                        "Minimum Bayar", "OPEN PAYMENT", new BigDecimal("2500"),
+                        "Biaya admin", "Rp2500", null, "1496387780", "320",
+                        null, null, null, null, null, null));
+
+        var answer = service.vaInquiry(COMPANY, new VaInquiryRequest("budi", SOURCE, VA_NUMBER));
+
+        assertThat(answer.name()).isEqualTo("test66666");
+        assertThat(answer.trxType()).isEqualTo("OPEN");
+        // The fee the VA service quotes beats the configured placeholder.
+        assertThat(answer.fee()).isEqualByComparingTo("2500");
+        assertThat(answer.inquiryRequestId()).isNull();
+        assertThat(answer.bill().trxType()).isEqualTo("o");
+        assertThat(answer.bill().billedAmountValue()).isEqualTo("OPEN PAYMENT");
+        assertThat(answer.bill().feeAmountLabel()).isEqualTo("Biaya admin");
+        assertThat(answer.bill().feeAmount()).isEqualByComparingTo("2500");
+        assertThat(answer.bill().trxId()).isEqualTo("1496387780");
+        assertThat(answer.bill().clientId()).isEqualTo("320");
+    }
+
+    @Test
+    void vaInquiryWithoutABillBlockFallsBackToTheConfiguredFeeAndReadsAsOpen() {
+        stubHappyPath();
+        var props = new TransferTypeProperties();
+        props.getVa().setFee(new BigDecimal("3000"));
+        service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                accountNameClient, coreTransferClient, authenticatorClient,
+                executionService, executionOutbox, props,
+                mock(PlatformTransactionManager.class));
+        when(coreTransferClient.inquireVa(anyString(), eq(VA_NUMBER), eq(SOURCE)))
+                .thenReturn(new CoreTransferClient.VaInquiry(VA_NUMBER, "INQ-1",
+                        "PT TOKOPEDIA", new BigDecimal("150000"), null, "00", "OK"));
+
+        var answer = service.vaInquiry(COMPANY, new VaInquiryRequest("budi", SOURCE, VA_NUMBER));
+
+        assertThat(answer.fee()).isEqualByComparingTo("3000");
+        assertThat(answer.trxType()).isEqualTo("OPEN");
+        assertThat(answer.bill().trxType()).isNull();
+    }
+
+    @Test
+    void aVaSubmitFreezesTheEchoedBillAndLaddersTheServiceFee() {
+        stubHappyPath();
+        var props = new TransferTypeProperties();
+        props.getVa().setFee(new BigDecimal("3000"));
+        service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                accountNameClient, coreTransferClient, authenticatorClient,
+                executionService, executionOutbox, props,
+                mock(PlatformTransactionManager.class));
+
+        service.submit(COMPANY, "budi", vaRequestWithBill("150000", openBill("2500")));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        // The fee the VA service quoted is the one frozen and laddered, not the placeholder.
+        assertThat(task.getValue().domestic().feeAmt()).isEqualByComparingTo("2500");
+        assertThat(task.getValue().vaBillJson())
+                .contains("\"trxType\":\"o\"")
+                .contains("\"billedAmountValue\":\"OPEN PAYMENT\"")
+                .contains("\"feeAmount\":2500")
+                .contains("\"trxId\":\"1496387780\"")
+                .doesNotContain("accountNumberTo");
+        // Round-trips through the domain record the release reads.
+        VaBill frozen = VaBill.fromJson(task.getValue().vaBillJson());
+        assertThat(frozen.isOpen()).isTrue();
+        assertThat(frozen.feeAmount()).isEqualByComparingTo("2500");
+    }
+
+    @Test
+    void aVaSubmitWithoutABillBlockFreezesNothingAndKeepsTheConfiguredFee() {
+        stubHappyPath();
+        when(transferMapper.findSysParamValue(TransferServiceImpl.SYS_PARAM_VA_FORMAT))
+                .thenReturn("99[0-9]{14}|9[0-9]{15}|8[0-9]{15}");
+
+        service.submit(COMPANY, "budi", vaRequest("150000", "IDR", VA_NUMBER, "INQ-123"));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().vaBillJson()).isNull();
+        assertThat(task.getValue().domestic().feeAmt()).isEqualByComparingTo("0");
+    }
+
+    @Test
+    void aFixedVaBillRefusesAnAmountThatDiffersFromTheBill() {
+        stubHappyPath();
+
+        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
+                vaRequestWithBill("100000", fixedBill("150000", "2500"))))
+                .isInstanceOf(BusinessRuleException.class)
+                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
+                        .isEqualTo("VA_AMOUNT_MISMATCH"))
+                .hasMessageContaining("Rp150000");
+        verify(trxTaskMapper, never()).insertTask(any());
+    }
+
+    @Test
+    void aFixedVaBillAcceptsTheExactAmountAndFreezesTheAdditionalLabels() {
+        stubHappyPath();
+
+        service.submit(COMPANY, "budi", vaRequestWithBill("150000", fixedBill("150000", "2500")));
+
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        VaBill frozen = VaBill.fromJson(task.getValue().vaBillJson());
+        assertThat(frozen.isOpen()).isFalse();
+        assertThat(frozen.kind()).isEqualTo("FIXED");
+        assertThat(frozen.billedAmount()).isEqualByComparingTo("150000");
+        assertThat(frozen.accountNumberTo()).isEqualTo("1000665901");
+        assertThat(frozen.additionalLabel1()).isEqualTo("Periode");
+        assertThat(frozen.additionalValue1()).isEqualTo("2026-09");
     }
 }

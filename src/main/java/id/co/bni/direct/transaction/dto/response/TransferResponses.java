@@ -56,7 +56,43 @@ public final class TransferResponses {
             String inquiryRequestId,
             BigDecimal fee,
             String responseCode,
-            String responseMessage) {
+            String responseMessage,
+            String trxType,
+            VaBillResponse bill) {
+
+        /** The pre-V11 shape (no open/fixed flag, no bill block). */
+        public VaInquiryResponse(String vaNumber, String name, BigDecimal amount,
+                                 String currency, String inquiryRequestId, BigDecimal fee,
+                                 String responseCode, String responseMessage) {
+            this(vaNumber, name, amount, currency, inquiryRequestId, fee, responseCode,
+                    responseMessage, null, null);
+        }
+    }
+
+    /**
+     * The bill block the VA service answered - the FE shows its labels and echoes the
+     * whole block back as {@code vaBill} on the submit. {@code trxType} is the raw flag
+     * ({@code o} = open payment); the outer {@code trxType} is the OPEN / FIXED reading.
+     */
+    public record VaBillResponse(
+            String trxType,
+            String billingLabel,
+            String vaNameLabel,
+            String billedAmountLabel,
+            String billedAmountValue,
+            BigDecimal billedAmount,
+            String feeAmountLabel,
+            String feeAmountValue,
+            BigDecimal feeAmount,
+            String accountNumberTo,
+            String trxId,
+            String clientId,
+            String additionalLabel1,
+            String additionalLabel2,
+            String additionalLabel3,
+            String additionalValue1,
+            String additionalValue2,
+            String additionalValue3) {
     }
 
     /**
@@ -118,7 +154,8 @@ public final class TransferResponses {
             String simsemJournalNo,
             String trxId,
             String endToEndId,
-            String transactionPurpose) {
+            String transactionPurpose,
+            String vaTrxType) {
     }
 
     /**

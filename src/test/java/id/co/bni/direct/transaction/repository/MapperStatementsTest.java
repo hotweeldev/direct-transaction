@@ -103,7 +103,15 @@ class MapperStatementsTest {
                 null, null,
                 new TrxTaskRows.BiFastInsert("01", "23231453124123", "01", "SVGS", "01", "0300",
                         "2026-09-04", null, null));
-        for (Object param : new Object[]{inHouse, domestic, cross, virtualAccount, bifast}) {
+        // V11: the VA shape with the frozen bill block, the 25th top-level property.
+        var virtualAccountBill = new TrxTaskRows.TaskInsert("T6", "CORP1", "MNU", "GCM_VA_BILLING", "REF6",
+                "PENDING_APPROVAL", 1, "111", "8241002201234567", "PT TOKOPEDIA",
+                java.math.BigDecimal.ONE, "IDR", null, null, null, "IMMEDIATE", "CU1", "MAKER",
+                "N", "tester",
+                new TrxTaskRows.DomesticInsert(null, null, null, null, null, null, null, null,
+                        null, null, null, null, null, null, new java.math.BigDecimal("2500")),
+                null, null, null, "{\"trxType\":\"o\",\"feeAmount\":2500}");
+        for (Object param : new Object[]{inHouse, domestic, cross, virtualAccount, bifast, virtualAccountBill}) {
             var boundSql = statement.getBoundSql(param);
             var handler = configuration.newParameterHandler(statement, param, boundSql);
             // Throws if any #{...} path (nested or not) cannot be resolved on the records.
@@ -125,6 +133,29 @@ class MapperStatementsTest {
                 java.math.BigDecimal.TEN, "DB2", null, null, null, null, null, null, "BMRIIDJA",
                 "CU1", "CU9", null, null, "01", "01", null, null, "T-1", "E-1");
         for (Object param : new Object[]{llg, bifast}) {
+            var boundSql = statement.getBoundSql(param);
+            var handler = configuration.newParameterHandler(statement, param, boundSql);
+            handler.setParameters(org.mockito.Mockito.mock(java.sql.PreparedStatement.class));
+        }
+    }
+
+    /** insertVirtualAccountFt binds the V11 bill labels when present and the defaults otherwise. */
+    @Test
+    void insertVirtualAccountFtBindsTheBillLabelsPresentOrDefault() throws Exception {
+        var statement = configuration.getMappedStatement(
+                TransferMapper.class.getName() + ".insertVirtualAccountFt");
+        var defaults = new id.co.bni.direct.transaction.entity.TransferRows.VaFtInsert(
+                "V1", "CORP1", "8241002201234567", "IDR", new java.math.BigDecimal("153000"),
+                "PT TOKOPEDIA", new java.math.BigDecimal("150000"), "Rp150000",
+                new java.math.BigDecimal("3000"), "Rp3000", "111", "REF", "TRX", "remark",
+                "CU1", "CU9");
+        var withBill = new id.co.bni.direct.transaction.entity.TransferRows.VaFtInsert(
+                "V2", "CORP1", "8320211228147123", "IDR", new java.math.BigDecimal("152500"),
+                "test66666", new java.math.BigDecimal("150000"), "OPEN PAYMENT",
+                new java.math.BigDecimal("2500"), "Rp2500", "111", "REF", "TRX", "remark",
+                "CU1", "CU9", "No.VA", "Nama", "o", "Minimum Bayar", "Biaya admin",
+                "1000665901", "Periode", null, null, "2026-09", null, null, "1496387780");
+        for (Object param : new Object[]{defaults, withBill}) {
             var boundSql = statement.getBoundSql(param);
             var handler = configuration.newParameterHandler(statement, param, boundSql);
             handler.setParameters(org.mockito.Mockito.mock(java.sql.PreparedStatement.class));

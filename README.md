@@ -142,14 +142,24 @@ Flow:
    `{userId, sourceAccountNo, vaNumber}`. The source account is part of the upstream request,
    so the FE asks for it before the "Periksa" step. The answer carries `name`, `amount`
    (may be `0` or null - the amount stays user-editable and is only pre-filled when `> 0`),
-   `currency`, `inquiryRequestId`, `fee` and the upstream `responseCode`/`responseMessage`.
+   `currency`, `inquiryRequestId`, `fee` and the upstream `responseCode`/`responseMessage`,
+   plus (since 2026-09-04) `trxType` (`OPEN` or `FIXED`) and the VA's own `bill` block:
+   `billingLabel`, `vaNameLabel`, `billedAmountLabel/Value`, `feeAmountLabel/Value`,
+   `feeAmount`, `accountNumberTo`, `trxId`, `clientId`, `additionalLabel1..3/Value1..3`
+   (see the integration spec §6). `OPEN` (`virtualAccountTrxType` `o`) means the customer
+   types the amount; `FIXED` means the bill amount is the one to pay.
    An upstream refusal is a 422 `VA_INQUIRY_REJECTED` carrying the VA service's own message
    (`983 Client Tidak Ditemukan.`, `982 Gagal Mendapatkan Respons.`); an integration outage
    is a 503, never a fabricated bill.
 2. **Submit** - the ordinary `POST /transfers` with `transferType: "VA"`,
    `beneficiaryAccountNo` = the VA number, `beneficiaryName` = the inquiry name (optional),
-   `amount` in IDR only, and `inquiryRequestId` from step 1, which is stored on the task
-   (`TRX_TASK.VA_INQUIRY_REQ_ID`, migration V9). Limits, approval matrix, OTP and the
+   `amount` in IDR only, `inquiryRequestId` from step 1 (may be blank - the VA service
+   accepts that), which is stored on the task (`TRX_TASK.VA_INQUIRY_REQ_ID`, migration V9),
+   and `vaBill` - the `bill` block echoed back unchanged and frozen as JSON on the task
+   (`TRX_TASK.VA_BILL_JSON`, migration V11). The ladder fee is the VA's `feeAmount` when the
+   block carries one. For a `FIXED` bill an amount that differs from the frozen
+   `billedAmount` is refused with 422 `VA_AMOUNT_MISMATCH`; an `OPEN` bill keeps the amount
+   free. Limits, approval matrix, OTP and the
    maker/approver/releaser stages are identical to LLG, keyed on service code
    `GCM_VA_BILLING` ("VA Billing Single") and the Transfer ke VA menu code. The flat fee
    `TRANSFER_VA_FEE` (`app.transfer.va.fee`, default 0 until the P4 fee engine) rides
@@ -159,7 +169,10 @@ Flow:
    journal lands in `TRX_TASK.CORE_JOURNAL`, `TRX_REF_NO` is minted from the shared legacy
    counter, and the executed record is written to the legacy VA booking table
    **`VIRTUAL_ACCOUNT_FT`** (not `BASE_FT`): `VA_NO`, `VA_NAME`, `BILLED_AMOUNT`,
-   `FEE_AMOUNT`, `TOTAL_AMOUNT`, `DEBITED_ACC_NO`, `REF_NO`, `TRX_REF_NO`, `CORP_ID`. A
+   `FEE_AMOUNT`, `TOTAL_AMOUNT`, `DEBITED_ACC_NO`, `REF_NO`, `TRX_REF_NO`, `CORP_ID`, and -
+   from the frozen `vaBill` block - `BILLING_LABEL`, `VA_LABEL`, `VA_TRX_TYPE`,
+   `BILLED_AMT_LABEL`, `BILLED_AMT_VALUE`, `FEE_AMT_LABEL`, `FEE_AMT_VALUE`, `ACC_NO_TO`,
+   `ADD_LABEL1..3`, `ADD_VALUE1..3` (constants only when a task has no block). A
    definite refusal (JSON error body, or a 2xx with a null `journalNum`) is `FAILED` with
    the VA message; a timeout is `UNKNOWN` with usage kept and no retry - the same
    never-a-second-debit rule as every other transfer.
@@ -174,13 +187,11 @@ Configuration:
 | direct-integration | `VA_CHANNEL` | `BNIDIRECT` | case-sensitive whitelist (`BNIDIRECT`, `NEWMOBILE`, `NEWIBANK` pass); which one is registered for BNI Direct is still to be confirmed with SOA |
 | direct-transaction | `TRANSFER_VA_FEE` | `0` | flat fee placeholder until P4 |
 
-Caveat - **the success shape of the inquiry has never been observed.** Every VA number
-available on DEV/UAT answers `982` (client known, partner billing backend silent) or `983`
-(client prefix unknown), so the field names for `inquiryRequestId`, the holder's name and
-the bill amount are best-guess aliases in the integration parser. The first successful
-inquiry on a registered VA fixes them; capture it with
-`infra/direct-infra/scripts/p3_va_probe.py --va <VA> --raw` and update the spec md. The E2E
-drill is `infra/direct-infra/scripts/p3_va_e2e.md`.
+Caveat - **the success shape has been observed only in a legacy production log**
+(integration spec §6, 2023-05-31): every UAT VA number still answers `982`/`983`, so the
+parser's field names come from that log, not from a live UAT answer. The first successful
+UAT inquiry will show in `INTEGRATION_LOG`; if any name differs, `VaPayloads` is the single
+place to adjust.
 
 ## P6 - cross-currency Transfer ke Bank Lain (two legs through a simsem account)
 

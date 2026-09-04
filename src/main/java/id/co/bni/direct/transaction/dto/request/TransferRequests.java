@@ -79,7 +79,36 @@ public final class TransferRequests {
             String transactionPurpose,
             String proxyType,
             String proxyValue,
-            @Valid BiFastCreditorRequest bifastCreditor) {
+            @Valid BiFastCreditorRequest bifastCreditor,
+            @Valid VaBillRequest vaBill) {
+
+        /** The pre-V11 shape (everything but the echoed VA bill block). */
+        public SubmitTransferRequest(String userId, String sourceAccountNo,
+                                     String beneficiaryAccountNo, String beneficiaryName,
+                                     MoneyRequest amount, String remark, OtpRequest otp,
+                                     String transferType, String beneficiaryBankId,
+                                     String beneficiaryAddress1, String beneficiaryAddress2,
+                                     String beneficiaryAddress3, String beneficiaryPhone,
+                                     String beneficiaryPostalCode, String beneficiaryIdType,
+                                     String beneficiaryIdNumber, String beneficiaryType,
+                                     String remitterResidencyCode, String beneficiaryResidencyCode,
+                                     String beneficiaryCurrency, BigDecimal debitAmount,
+                                     String rateType, String underlyingDocType,
+                                     String underlyingDocNumber, String underlyingDocName,
+                                     BigDecimal underlyingDocAmount, String underlyingDocExpiry,
+                                     String inquiryRequestId, String transactionPurpose,
+                                     String proxyType, String proxyValue,
+                                     BiFastCreditorRequest bifastCreditor) {
+            this(userId, sourceAccountNo, beneficiaryAccountNo, beneficiaryName, amount,
+                    remark, otp, transferType, beneficiaryBankId, beneficiaryAddress1,
+                    beneficiaryAddress2, beneficiaryAddress3, beneficiaryPhone,
+                    beneficiaryPostalCode, beneficiaryIdType, beneficiaryIdNumber,
+                    beneficiaryType, remitterResidencyCode, beneficiaryResidencyCode,
+                    beneficiaryCurrency, debitAmount, rateType, underlyingDocType,
+                    underlyingDocNumber, underlyingDocName, underlyingDocAmount,
+                    underlyingDocExpiry, inquiryRequestId, transactionPurpose, proxyType,
+                    proxyValue, bifastCreditor, null);
+        }
 
         /** The pre-P7 shape (everything but the BI-Fast purpose, proxy and creditor echo). */
         public SubmitTransferRequest(String userId, String sourceAccountNo,
@@ -199,6 +228,33 @@ public final class TransferRequests {
             @NotBlank String userId,
             @NotBlank String sourceAccountNo,
             @NotBlank String vaNumber) {
+    }
+
+    /**
+     * The bill block the VA inquiry answered, echoed verbatim on a VA submit and frozen on
+     * the task (V11) so the release books the legacy VIRTUAL_ACCOUNT_FT row from exactly
+     * what the maker saw. Field names are the inquiry response's; every field optional.
+     * {@code trxType} {@code o} = open payment, anything else = fixed bill.
+     */
+    public record VaBillRequest(
+            String trxType,
+            String billingLabel,
+            String vaNameLabel,
+            String billedAmountLabel,
+            String billedAmountValue,
+            BigDecimal billedAmount,
+            String feeAmountLabel,
+            String feeAmountValue,
+            BigDecimal feeAmount,
+            String accountNumberTo,
+            String trxId,
+            String clientId,
+            String additionalLabel1,
+            String additionalLabel2,
+            String additionalLabel3,
+            String additionalValue1,
+            String additionalValue2,
+            String additionalValue3) {
     }
 
     /**

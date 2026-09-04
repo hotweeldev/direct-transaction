@@ -356,4 +356,35 @@ class CoreTransferClientTest {
                 "REF-1", "113179933", "10000.00", "2500.00", "BMRIIDJA", "9876543210", null, null, "01")))
                 .isInstanceOf(ServiceUnavailableException.class);
     }
+
+    /**
+     * The real SNAP success body (legacy log 2023-05-31, passed through by
+     * direct-integration under its own camelCase names): the name lives in
+     * virtualAccountName, blank strings mean absent, and the whole bill block rides
+     * along for the legacy VIRTUAL_ACCOUNT_FT row.
+     */
+    @Test
+    void aVaInquiryReadsTheFullSnapBillBlock() {
+        CoreTransferClient.VaInquiry bill = CoreTransferClient.mapVaInquiryResponse(200, json(
+                "{\"data\":" + "{\"responseCode\":\"000\",\"responseMessage\":\"Success\",\"clientId\":\"320\",\"trxId\":\"1496387780\",\"billingNumber\":\"8320211228147123\",\"billingLabel\":\"No.VA\",\"virtualAccountNumber\":\"8320211228147123\",\"virtualAccountName\":\"test66666\",\"vaNameLabel\":\"Nama\",\"virtualAccountTrxType\":\"o\",\"billedAmountLabel\":\"Minimum Bayar\",\"billedAmountValue\":\"OPEN PAYMENT\",\"billedAmount\":\"0\",\"additionalLabel1\":\"\",\"additionalLabel2\":\"\",\"additionalLabel3\":\"\",\"additionalValue1\":\"\",\"additionalValue2\":\"\",\"additionalValue3\":\"\",\"feeAmountLabel\":\"Biaya admin\",\"feeAmountValue\":\"Rp0\",\"feeAmount\":\"0\",\"accountNumberTo\":\"\",\"inquiryRequestId\":\"\"}" + "}"), "8320211228147123");
+
+        assertThat(bill.billingNumber()).isEqualTo("8320211228147123");
+        assertThat(bill.billingName()).isEqualTo("test66666");
+        assertThat(bill.virtualAccountName()).isEqualTo("test66666");
+        assertThat(bill.virtualAccountTrxType()).isEqualTo("o");
+        assertThat(bill.billedAmount()).isEqualByComparingTo("0");
+        assertThat(bill.billedAmountLabel()).isEqualTo("Minimum Bayar");
+        assertThat(bill.billedAmountValue()).isEqualTo("OPEN PAYMENT");
+        assertThat(bill.feeAmount()).isEqualByComparingTo("0");
+        assertThat(bill.feeAmountLabel()).isEqualTo("Biaya admin");
+        assertThat(bill.feeAmountValue()).isEqualTo("Rp0");
+        assertThat(bill.trxId()).isEqualTo("1496387780");
+        assertThat(bill.clientId()).isEqualTo("320");
+        assertThat(bill.responseCode()).isEqualTo("000");
+        // "" is how the service spells "absent".
+        assertThat(bill.inquiryRequestId()).isNull();
+        assertThat(bill.accountNumberTo()).isNull();
+        assertThat(bill.additionalLabel1()).isNull();
+        assertThat(bill.additionalValue3()).isNull();
+    }
 }

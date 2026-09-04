@@ -311,14 +311,18 @@
                                         BILLED_AMT_LABEL, BILLED_AMT_VALUE, BILLED_AMOUNT,
                                         FEE_AMT_LABEL, FEE_AMT_VALUE, FEE_AMOUNT,
                                         ACC_NO_TO, DEBITED_ACC_NO, REF_NO,
+                                        ADD_LABEL1, ADD_LABEL2, ADD_LABEL3,
+                                        ADD_VALUE1, ADD_VALUE2, ADD_VALUE3, BEN_REF_NO,
                                         STANDING_INSTRUCTION, NOTIFICATION_FLAG, PROCESS_FLAG,
                                         TRX_REF_NO, UPDATED_BY, UPDATED_DT, REMARK)
         VALUES (#{id}, SYSDATE, #{createdBy}, SYSDATE, #{corpId},
-                #{vaNo}, #{currency}, #{totalAmt}, #{vaNo}, N'No.VA',
-                #{vaName}, N'Nama', N'o',
-                N'Nominal', #{billedAmtValue}, #{billedAmt},
-                N'Biaya admin', #{feeAmtValue}, #{feeAmt},
-                NULL, #{debitedAcctNo}, #{refNo},
+                #{vaNo}, #{currency}, #{totalAmt}, #{vaNo}, #{billingLabel},
+                #{vaName}, #{vaLabel}, #{vaTrxType},
+                #{billedAmtLabel}, #{billedAmtValue}, #{billedAmt},
+                #{feeAmtLabel}, #{feeAmtValue}, #{feeAmt},
+                #{accNoTo}, #{debitedAcctNo}, #{refNo},
+                #{addLabel1}, #{addLabel2}, #{addLabel3},
+                #{addValue1}, #{addValue2}, #{addValue3}, #{benRefNo},
                 N'1', N'1', N'Y',
                 #{trxRefNo}, #{updatedBy}, SYSDATE, #{remark})
     </insert>

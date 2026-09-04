@@ -236,6 +236,31 @@ public final class TransferRows {
             String trxRefNo,
             String remark,
             String createdBy,
-            String updatedBy) {
+            String updatedBy,
+            String billingLabel,
+            String vaLabel,
+            String vaTrxType,
+            String billedAmtLabel,
+            String feeAmtLabel,
+            String accNoTo,
+            String addLabel1,
+            String addLabel2,
+            String addLabel3,
+            String addValue1,
+            String addValue2,
+            String addValue3,
+            String benRefNo) {
+
+        /** The pre-V11 shape: the labels the legacy sample rows carry, no bill block. */
+        public VaFtInsert(String id, String corpId, String vaNo, String currency,
+                          BigDecimal totalAmt, String vaName, BigDecimal billedAmt,
+                          String billedAmtValue, BigDecimal feeAmt, String feeAmtValue,
+                          String debitedAcctNo, String refNo, String trxRefNo, String remark,
+                          String createdBy, String updatedBy) {
+            this(id, corpId, vaNo, currency, totalAmt, vaName, billedAmt, billedAmtValue,
+                    feeAmt, feeAmtValue, debitedAcctNo, refNo, trxRefNo, remark, createdBy,
+                    updatedBy, "No.VA", "Nama", "o", "Nominal", "Biaya admin",
+                    null, null, null, null, null, null, null, null);
+        }
     }
 }

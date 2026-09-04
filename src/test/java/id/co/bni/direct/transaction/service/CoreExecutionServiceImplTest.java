@@ -1259,4 +1259,76 @@ class CoreExecutionServiceImplTest {
         assertThat(result.message()).contains("900067");
         verify(trxTaskMapper, never()).markExecuted(anyString(), anyString(), anyString(), anyString());
     }
+
+    // ---- V11: the frozen VA bill block feeds the legacy row ----
+
+    private static ExecutionTaskRow vaTaskWithBill(String vaBillJson) {
+        return new ExecutionTaskRow(TASK, "CORP1", "MNU_GCME_050200", "GCM_VA_BILLING",
+                "20260831100000228541", "READY_TO_EXECUTE", "113179933", VA_NUMBER,
+                "PT TOKOPEDIA", new BigDecimal("150000"), "IDR", "bayar tagihan", "CU1", 3L,
+                null, null, null, null, null, null, null, null, null, null, null,
+                null, null, new BigDecimal("2500"),
+                null, null, null, null, null,
+                "INQ-123",
+                null, null, null, null, null, null, null, null, null,
+                vaBillJson);
+    }
+
+    @Test
+    void aVaTaskBooksTheFrozenBillLabelsIntoTheLegacyRow() {
+        stubClaimableVa();
+        when(trxTaskMapper.findTaskForExecution(TASK)).thenReturn(vaTaskWithBill(
+                "{\"trxType\":\"o\",\"billingLabel\":\"No.VA\",\"vaNameLabel\":\"Nama\","
+                        + "\"billedAmountLabel\":\"Minimum Bayar\",\"billedAmountValue\":\"OPEN PAYMENT\","
+                        + "\"feeAmountLabel\":\"Biaya admin\",\"feeAmountValue\":\"Rp2500\",\"feeAmount\":2500,"
+                        + "\"accountNumberTo\":\"1000665901\",\"trxId\":\"1496387780\",\"clientId\":\"320\","
+                        + "\"additionalLabel1\":\"Periode\",\"additionalValue1\":\"2026-09\",\"newField\":\"x\"}"));
+        when(coreTransferClient.transferVa(any()))
+                .thenReturn(new TransferOutcome(Status.SUCCESS, "902794", "Success"));
+
+        var result = service.execute(TASK);
+
+        assertThat(result.status()).isEqualTo("EXECUTED");
+        ArgumentCaptor<VaFtInsert> row = ArgumentCaptor.forClass(VaFtInsert.class);
+        verify(transferMapper).insertVirtualAccountFt(row.capture());
+        // Verbatim from the inquiry, exactly as the legacy row stores it.
+        assertThat(row.getValue().billingLabel()).isEqualTo("No.VA");
+        assertThat(row.getValue().vaLabel()).isEqualTo("Nama");
+        assertThat(row.getValue().vaTrxType()).isEqualTo("o");
+        assertThat(row.getValue().billedAmtLabel()).isEqualTo("Minimum Bayar");
+        assertThat(row.getValue().billedAmtValue()).isEqualTo("OPEN PAYMENT");
+        assertThat(row.getValue().billedAmt()).isEqualByComparingTo("150000");
+        assertThat(row.getValue().feeAmtLabel()).isEqualTo("Biaya admin");
+        assertThat(row.getValue().feeAmtValue()).isEqualTo("Rp2500");
+        assertThat(row.getValue().feeAmt()).isEqualByComparingTo("2500");
+        assertThat(row.getValue().totalAmt()).isEqualByComparingTo("152500");
+        assertThat(row.getValue().accNoTo()).isEqualTo("1000665901");
+        assertThat(row.getValue().addLabel1()).isEqualTo("Periode");
+        assertThat(row.getValue().addValue1()).isEqualTo("2026-09");
+        assertThat(row.getValue().addLabel2()).isNull();
+        // The VA service's own id lands on BEN_REF_NO.
+        assertThat(row.getValue().benRefNo()).isEqualTo("1496387780");
+        verify(trxTaskMapper).markExecuted(eq(TASK), eq("902794"), anyString(), eq("CU9"));
+    }
+
+    @Test
+    void aVaTaskWithAnUnparsableBillBlockStillBooksWithTheDefaultLabels() {
+        stubClaimableVa();
+        when(trxTaskMapper.findTaskForExecution(TASK)).thenReturn(vaTaskWithBill("{not json"));
+        when(coreTransferClient.transferVa(any()))
+                .thenReturn(new TransferOutcome(Status.SUCCESS, "902795", "Success"));
+
+        var result = service.execute(TASK);
+
+        assertThat(result.status()).isEqualTo("EXECUTED");
+        ArgumentCaptor<VaFtInsert> row = ArgumentCaptor.forClass(VaFtInsert.class);
+        verify(transferMapper).insertVirtualAccountFt(row.capture());
+        assertThat(row.getValue().billingLabel()).isEqualTo("No.VA");
+        assertThat(row.getValue().vaTrxType()).isEqualTo("o");
+        assertThat(row.getValue().billedAmtLabel()).isEqualTo("Nominal");
+        assertThat(row.getValue().billedAmtValue()).isEqualTo("Rp150000");
+        assertThat(row.getValue().feeAmtValue()).isEqualTo("Rp2500");
+        assertThat(row.getValue().accNoTo()).isNull();
+        assertThat(row.getValue().benRefNo()).isNull();
+    }
 }

@@ -5,6 +5,7 @@ import id.co.bni.direct.transaction.dto.request.TransferRequests.InquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.InterbankInquiryRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.OtpChallengeRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.SubmitTransferRequest;
+import id.co.bni.direct.transaction.dto.request.TransferRequests.VaBillRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.VaInquiryRequest;
 import id.co.bni.direct.transaction.config.TransferTypeProperties;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.BankResponse;
@@ -17,7 +18,9 @@ import id.co.bni.direct.transaction.dto.response.TransferResponses.OtpChallengeR
 import id.co.bni.direct.transaction.dto.response.TransferResponses.StageResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.SubmitResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.TaskDetailResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.VaBillResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.VaInquiryResponse;
+import id.co.bni.direct.transaction.service.VaBill;
 import id.co.bni.direct.transaction.entity.TransferRows.BankLimitRow;
 import id.co.bni.direct.transaction.entity.TransferRows.BiFastPurposeRow;
 import id.co.bni.direct.transaction.entity.TransferRows.CorpFlagsRow;
@@ -273,7 +276,7 @@ public class TransferServiceImpl implements TransferService {
             // VA fee travels on the same FEE_AMT the domestic types use, so the ladder,
             // execution and the detail screen all read one column. No own/3rd probe: a
             // VA is never one of the company's own accounts.
-            domestic = resolveVirtualAccount(request, currency);
+            domestic = resolveVirtualAccount(request, currency, amount);
             srvcCd = TransferType.SRVC_VA;
             menuCd = MENU_CD_VA;
         } else if (type.isDomestic()) {
@@ -462,7 +465,8 @@ public class TransferServiceImpl implements TransferService {
                 domestic,
                 cross,
                 type.isVirtualAccount() ? trimTo(request.inquiryRequestId(), 64) : null,
-                bifast));
+                bifast,
+                type.isVirtualAccount() ? VaBill.toJson(vaBill(request)) : null));
 
         if (!singleUser) {
             int seq = 1;
@@ -618,7 +622,14 @@ public class TransferServiceImpl implements TransferService {
                 task.debitCcyCd(), task.debitAmt(), task.exchangeRate(),
                 task.advisoryMsg(), task.sourceProductType(),
                 task.twoLegState(), task.simsemAcctNo(), task.journalNoSimsem(),
-                task.trxId(), task.endToEndId(), task.bifastPurposeCd());
+                task.trxId(), task.endToEndId(), task.bifastPurposeCd(),
+                vaTrxType(task.vaBillJson()));
+    }
+
+    /** OPEN / FIXED from the frozen VA bill block; null for a task without one. */
+    private static String vaTrxType(String vaBillJson) {
+        VaBill bill = VaBill.fromJson(vaBillJson);
+        return bill == null ? null : bill.kind();
     }
 
     @Override
@@ -722,15 +733,34 @@ public class TransferServiceImpl implements TransferService {
         String vaNumber = validateVaNumber(request.vaNumber());
         CoreTransferClient.VaInquiry inquiry = coreTransferClient.inquireVa(
                 inquiryRefNo(), vaNumber, request.sourceAccountNo());
+        // The bill block the service answered, as the FE will echo it back. The fee the
+        // service quotes wins over the configured placeholder: what the VA service charges
+        // is what the ladder must see and what the legacy row must carry.
+        VaBill bill = new VaBill(
+                inquiry.virtualAccountTrxType(), inquiry.billingLabel(), inquiry.vaNameLabel(),
+                inquiry.billedAmountLabel(), inquiry.billedAmountValue(), inquiry.billedAmount(),
+                inquiry.feeAmountLabel(), inquiry.feeAmountValue(), inquiry.feeAmount(),
+                inquiry.accountNumberTo(), inquiry.trxId(), inquiry.clientId(),
+                inquiry.additionalLabel1(), inquiry.additionalLabel2(), inquiry.additionalLabel3(),
+                inquiry.additionalValue1(), inquiry.additionalValue2(), inquiry.additionalValue3());
+        String name = inquiry.billingName() != null ? inquiry.billingName() : inquiry.virtualAccountName();
         return new VaInquiryResponse(
                 vaNumber,
-                inquiry.billingName(),
+                name,
                 inquiry.billedAmount(),
                 inquiry.currency() != null ? inquiry.currency() : "IDR",
                 inquiry.inquiryRequestId(),
-                nvl(transferTypeProperties.getVa().getFee()),
+                inquiry.feeAmount() != null ? inquiry.feeAmount() : nvl(transferTypeProperties.getVa().getFee()),
                 inquiry.responseCode(),
-                inquiry.responseMessage());
+                inquiry.responseMessage(),
+                bill.kind(),
+                new VaBillResponse(
+                        bill.trxType(), bill.billingLabel(), bill.vaNameLabel(),
+                        bill.billedAmountLabel(), bill.billedAmountValue(), bill.billedAmount(),
+                        bill.feeAmountLabel(), bill.feeAmountValue(), bill.feeAmount(),
+                        bill.accountNumberTo(), bill.trxId(), bill.clientId(),
+                        bill.additionalLabel1(), bill.additionalLabel2(), bill.additionalLabel3(),
+                        bill.additionalValue1(), bill.additionalValue2(), bill.additionalValue3()));
     }
 
     @Override
@@ -845,17 +875,44 @@ public class TransferServiceImpl implements TransferService {
      * rest of the domestic block stays NULL - there is no destination bank.
      */
     private TrxTaskRows.DomesticInsert resolveVirtualAccount(SubmitTransferRequest request,
-                                                             String currency) {
+                                                             String currency, BigDecimal amount) {
         if (!"IDR".equals(currency)) {
             throw new BusinessRuleException("TRANSFER_FIELDS_INVALID",
                     "Transfer ke Virtual Account hanya tersedia untuk mata uang IDR.");
         }
         validateVaNumber(request.beneficiaryAccountNo());
-        BigDecimal fee = transferTypeProperties.getVa().getFee();
+        // The echoed bill block (V11). A fixed bill pins the amount the customer may pay;
+        // the fee the VA service quoted wins over the configured placeholder, so the
+        // ladder and the usage counters see what the service will actually charge.
+        VaBill bill = vaBill(request);
+        if (bill != null && !bill.isOpen() && bill.billedAmount() != null
+                && bill.billedAmount().signum() > 0
+                && amount.compareTo(bill.billedAmount()) != 0) {
+            throw new BusinessRuleException("VA_AMOUNT_MISMATCH",
+                    "Nominal harus sama dengan tagihan Virtual Account, yaitu Rp"
+                            + bill.billedAmount().stripTrailingZeros().toPlainString() + ".");
+        }
+        BigDecimal fee = bill != null && bill.feeAmount() != null
+                ? bill.feeAmount() : transferTypeProperties.getVa().getFee();
         return new TrxTaskRows.DomesticInsert(
                 null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null,
                 fee != null ? fee : BigDecimal.ZERO);
+    }
+
+    /** The submit's echoed VA bill block as the domain record, or null when absent. */
+    private static VaBill vaBill(SubmitTransferRequest request) {
+        VaBillRequest b = request.vaBill();
+        if (b == null) {
+            return null;
+        }
+        return new VaBill(
+                b.trxType(), b.billingLabel(), b.vaNameLabel(),
+                b.billedAmountLabel(), b.billedAmountValue(), b.billedAmount(),
+                b.feeAmountLabel(), b.feeAmountValue(), b.feeAmount(),
+                b.accountNumberTo(), b.trxId(), b.clientId(),
+                b.additionalLabel1(), b.additionalLabel2(), b.additionalLabel3(),
+                b.additionalValue1(), b.additionalValue2(), b.additionalValue3());
     }
 
     /** The trimmed VA number, or the 422 when it does not match the legacy format. */

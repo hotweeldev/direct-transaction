@@ -19,6 +19,7 @@ import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
 import id.co.bni.direct.transaction.service.ExecutionService;
 import id.co.bni.direct.transaction.service.SimsemPool;
 import id.co.bni.direct.transaction.service.TransferType;
+import id.co.bni.direct.transaction.service.VaBill;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Primary;
@@ -520,14 +521,35 @@ public class CoreExecutionServiceImpl implements ExecutionService {
             String trxRefNo = TransferServiceImpl.nextRefNo(
                     transferMapper, task.srvcCd(), task.corpId());
             BigDecimal fee = nvl(task.feeAmt());
+            // The legacy row carries the presentation block the inquiry answered (V11),
+            // verbatim - labels, display values, the open/fixed flag, the VA service's
+            // ids. A task without the block (pre-V11, or an FE that did not echo it)
+            // books the constants the legacy sample rows carry.
+            VaBill bill = VaBill.fromJson(task.vaBillJson());
             transferMapper.insertVirtualAccountFt(new VaFtInsert(
                     newId(), task.corpId(), task.benAcctNo(),
                     task.trxCcyCd() != null ? task.trxCcyCd() : "IDR",
                     amount.add(fee), task.benAcctNm(),
-                    amount, rupiah(amount), fee, rupiah(fee),
+                    amount,
+                    bill != null && notBlank(bill.billedAmountValue()) ? bill.billedAmountValue() : rupiah(amount),
+                    fee,
+                    bill != null && notBlank(bill.feeAmountValue()) ? bill.feeAmountValue() : rupiah(fee),
                     task.remAcctNo(), task.refNo(), trxRefNo,
                     trimTo(task.remark1(), 40),
-                    task.makerUserId(), executedBy));
+                    task.makerUserId(), executedBy,
+                    bill != null && notBlank(bill.billingLabel()) ? trimTo(bill.billingLabel(), 100) : "No.VA",
+                    bill != null && notBlank(bill.vaNameLabel()) ? trimTo(bill.vaNameLabel(), 100) : "Nama",
+                    bill != null && notBlank(bill.trxType()) ? trimTo(bill.trxType(), 10) : VaBill.TRX_TYPE_OPEN,
+                    bill != null && notBlank(bill.billedAmountLabel()) ? trimTo(bill.billedAmountLabel(), 100) : "Nominal",
+                    bill != null && notBlank(bill.feeAmountLabel()) ? trimTo(bill.feeAmountLabel(), 100) : "Biaya admin",
+                    bill != null ? trimTo(bill.accountNumberTo(), 40) : null,
+                    bill != null ? trimTo(bill.additionalLabel1(), 200) : null,
+                    bill != null ? trimTo(bill.additionalLabel2(), 200) : null,
+                    bill != null ? trimTo(bill.additionalLabel3(), 200) : null,
+                    bill != null ? trimTo(bill.additionalValue1(), 200) : null,
+                    bill != null ? trimTo(bill.additionalValue2(), 200) : null,
+                    bill != null ? trimTo(bill.additionalValue3(), 200) : null,
+                    bill != null ? trimTo(bill.trxId(), 100) : null));
             trxTaskMapper.markExecuted(task.id(), outcome.coreJournal(), trxRefNo, executedBy);
             insertExecuteAction(task, executedBy,
                     "Pembayaran Virtual Account berhasil. journalNum=" + outcome.coreJournal());
