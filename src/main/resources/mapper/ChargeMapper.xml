@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  The charge engine. Two of these statements read the legacy tariff chain (CORP_CH_PC_DTL,
+  COM_CH_PC_DTL and the COM_MT_CH_MTRX matrix behind both); the other three are ordinary
+  statements against TRX_TASK_CHARGE, this service's own table (V12). This service creates
+  none of the legacy tables and Flyway must never try.
+
+  Legacy columns are NVARCHAR2, so every literal compared against one is written N'...' -
+  a plain 'N' next to an NVARCHAR2 column raises ORA-12704 (character set mismatch). The
+  TRX_TASK_CHARGE columns follow the same style, so the rule holds throughout this file.
+
+  WHAT THE LIVE LEGACY DATA ACTUALLY LOOKS LIKE. The chain below was walked against the
+  real schema on 2026-09-07, and the findings are worth writing down because the table
+  names suggest the opposite of what is true.
+
+  CORP_CH_PC_DTL IS THE AUTHORITATIVE TARIFF, NOT AN OVERRIDE. The name reads like an
+  exception table for negotiated customers, and it is not: it holds 53,650 rows across 780
+  companies in the SITLITE copy, and companies whose CORP.IS_SPC_CH is N'N' - the ones with
+  no special charging at all - have rows there just the same. The mechanism is that the
+  package is a TEMPLATE which the legacy procedure INJECT_CHARGE_COMPANY copies down into
+  the per-company table when a company is set up. So the company row is the tariff that was
+  actually applied, and the package is only what it was born from.
+
+  THE FALLBACK IS NOT A CORNER CASE. 1,548 of the 2,303 active companies have no
+  per-company row at all - the injection was never run for them - so a charge engine that
+  reads only CORP_CH_PC_DTL finds nothing for two thirds of the estate. That is why
+  findPackageTariffs exists and why the caller must actually use it.
+
+  DUPLICATES ARE NORMAL AND THE SQL DOES NOT RESOLVE THEM. Neither table has a soft-delete
+  column and neither has a unique key beyond ID, so both contain repeated (package or
+  company, matrix detail, currency) keys: 92 in the package table, 282 in the company
+  table. The typical pair is a 2015 row sitting beside a 2021 row with a different amount -
+  the shape of an edit that was implemented as an insert. UPDATED_DT is therefore selected
+  by both statements and the SERVICE picks the newest row per (charge type, currency); the
+  SQL deliberately does not try to, because a FETCH FIRST or a MAX() here would bury the
+  choice in a query plan where nobody would find it. Note plainly that this newest-wins
+  rule is an INFERENCE awaiting confirmation from the legacy team: nothing in the database
+  states which of a duplicate pair is live, and the alternative reading - that the legacy
+  application picks by insertion order or by matrix detail - cannot be ruled out from the
+  data alone.
+
+  A TRANSFER CARRIES SEVERAL COMPONENTS, NEVER ONE. Every interbank service is billed as a
+  generic transfer fee plus a rail-specific fee: LLG is Transfer Fee (COM_MT_CH_TYP.CD 014)
+  plus LLG Fee (009), RTGS is 014 plus RTGS Fee (012), ONLINE is 014 plus Online Domestic
+  Fee (020), and BI-Fast is 014 plus BI-FAST Domestic Fee (035). Both statements therefore
+  return a LIST per service, and each element carries its own currency.
+
+  CH_OC_CD PINS THE OCCASION. N'TRX' rows are per-transaction charges, which is all this
+  engine is about; N'PRD' rows are periodical (monthly subscription-style) charges billed by
+  a different process entirely, and letting one leak into a transaction's breakdown would
+  charge a customer their monthly fee on every transfer. The guard is in the matrix join,
+  alongside the matrix's own IS_DELETE / IS_INACTIVE flags and the charge type's.
+-->
+<mapper namespace="id.co.bni.direct.transaction.repository.mapper.ChargeMapper">
+
+    <!--
+      The matrix leg both tariff reads share: the matrix row pins the service and the
+      occasion, the matrix DETAIL row names the charge type, and COM_MT_CH_TYP supplies the
+      code and the display name. The two IS_ flags on each are the only "is this row still
+      live" signal these tables have - the tariff tables themselves have none.
+    -->
+    <sql id="chargeMatrix">
+        JOIN COM_MT_CH_MTRX m
+          ON m.ID = o.CH_MTRX_ID
+         AND m.SRVC_CD = #{srvcCd}
+         AND m.CH_OC_CD = N'TRX'
+         AND m.IS_DELETE = N'N'
+         AND m.IS_INACTIVE = N'N'
+        JOIN COM_MT_CH_MTRX_DTL md
+          ON md.ID = o.CH_MTRX_DTL_ID
+        JOIN COM_MT_CH_TYP t
+          ON t.CD = md.CH_TYP_CD
+         AND t.IS_DELETE = N'N'
+         AND t.IS_INACTIVE = N'N'
+    </sql>
+
+    <!--
+      The per-company tariff - the authoritative one. VAL_TYP rides along unconverted:
+      N'F' rows carry a flat amount in VALUE, N'B' rows carry an id into a banded table and
+      must be refused by the caller rather than parsed as a number (ChargeRows.TariffRow).
+      UPDATED_DT is here for the duplicate resolution the service performs.
+    -->
+    <select id="findCompanyTariffs" resultType="id.co.bni.direct.transaction.entity.ChargeRows$TariffRow">
+        SELECT t.CD         AS "chTypCd",
+               t.NM         AS "chTypNm",
+               o.CCY_CD     AS "ccyCd",
+               o.VAL_TYP    AS "valTyp",
+               o.VALUE      AS "value",
+               o.UPDATED_DT AS "updatedDt"
+        FROM CORP_CH_PC_DTL o
+        <include refid="chargeMatrix"/>
+        WHERE o.CORP_ID = #{companyId}
+    </select>
+
+    <!--
+      The package template, used only as the fallback for the two thirds of companies with
+      no row of their own. Entered from CORP because the package is not held on the tariff
+      row: the company names a SERVICE package (CORP.SRVC_PC_CD), the service package names
+      a CHARGE package (COM_SRVC_PC.CH_PC_CD), and the charge package is what COM_CH_PC_DTL
+      hangs off. CORP.IS_DELETE is checked here because CORP has the soft-delete flag that
+      the tariff tables lack.
+    -->
+    <select id="findPackageTariffs" resultType="id.co.bni.direct.transaction.entity.ChargeRows$TariffRow">
+        SELECT t.CD         AS "chTypCd",
+               t.NM         AS "chTypNm",
+               o.CCY_CD     AS "ccyCd",
+               o.VAL_TYP    AS "valTyp",
+               o.VALUE      AS "value",
+               o.UPDATED_DT AS "updatedDt"
+        FROM CORP c
+        JOIN COM_SRVC_PC sp
+          ON sp.CD = c.SRVC_PC_CD
+        JOIN COM_CH_PC_DTL o
+          ON o.CH_PC_CD = sp.CH_PC_CD
+        <include refid="chargeMatrix"/>
+        WHERE c.ID = #{companyId}
+          AND c.IS_DELETE = N'N'
+    </select>
+
+    <!-- One resolved component, frozen at submit. VERSION starts at 0 and CREATED_DT comes
+         from SYSDATE so every environment stamps database time (the V1 convention). The
+         re-quote columns are left NULL: they are release's business, never submit's. -->
+    <insert id="insertCharge">
+        INSERT INTO TRX_TASK_CHARGE (ID, TRX_TASK_ID, SEQ_NO, CH_TYP_CD, CH_TYP_NM,
+                                     CCY_CD, AMT, IDR_AMT, FX_RATE, FX_RATE_TYPE,
+                                     FX_RATE_SIDE, TARIFF_SOURCE, VERSION, CREATED_BY,
+                                     CREATED_DT)
+        VALUES (#{id}, #{trxTaskId}, #{seqNo}, #{chTypCd}, #{chTypNm},
+                #{ccyCd}, #{amt}, #{idrAmt}, #{fxRate}, #{fxRateType},
+                #{fxRateSide}, #{tariffSource}, 0, #{createdBy},
+                SYSDATE)
+    </insert>
+
+    <!-- The breakdown behind TRX_TASK.FEE_AMT. Ordered by SEQ_NO so the components are
+         presented in the same order on every screen that shows them. -->
+    <select id="findCharges" resultType="id.co.bni.direct.transaction.entity.ChargeRows$ChargeRow">
+        SELECT SEQ_NO           AS "seqNo",
+               CH_TYP_CD        AS "chTypCd",
+               CH_TYP_NM        AS "chTypNm",
+               CCY_CD           AS "ccyCd",
+               AMT              AS "amt",
+               IDR_AMT          AS "idrAmt",
+               FX_RATE          AS "fxRate",
+               FX_RATE_TYPE     AS "fxRateType",
+               FX_RATE_SIDE     AS "fxRateSide",
+               TARIFF_SOURCE    AS "tariffSource",
+               REQUOTED_IDR_AMT AS "requotedIdrAmt",
+               REQUOTED_FX_RATE AS "requotedFxRate"
+        FROM TRX_TASK_CHARGE
+        WHERE TRX_TASK_ID = #{taskId}
+        ORDER BY SEQ_NO
+    </select>
+
+    <!-- Release re-quoted this component. IDR_AMT, FX_RATE and AMT are NOT in the SET
+         list, on purpose: what the approvers saw stays readable next to what was finally
+         charged. REQUOTED_DT is SYSDATE for the same reason the other timestamps are. -->
+    <update id="updateRequote">
+        UPDATE TRX_TASK_CHARGE
+        SET REQUOTED_IDR_AMT = #{requotedIdrAmt},
+            REQUOTED_FX_RATE = #{requotedFxRate},
+            REQUOTED_DT = SYSDATE,
+            VERSION = VERSION + 1
+        WHERE TRX_TASK_ID = #{taskId}
+          AND SEQ_NO = #{seqNo}
+    </update>
+</mapper>

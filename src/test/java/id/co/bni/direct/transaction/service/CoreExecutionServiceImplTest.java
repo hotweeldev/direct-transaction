@@ -16,6 +16,7 @@ import id.co.bni.direct.transaction.integration.CoreTransferClient;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.BiFastOutcome;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.Status;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.TransferOutcome;
+import id.co.bni.direct.transaction.repository.mapper.ChargeMapper;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
 import id.co.bni.direct.transaction.service.impl.CoreExecutionServiceImpl;
@@ -63,7 +64,10 @@ class CoreExecutionServiceImplTest {
         coreTransferClient = mock(CoreTransferClient.class);
         txManager = mock(PlatformTransactionManager.class);
         simsemPool = mock(SimsemPool.class);
-        service = new CoreExecutionServiceImpl(trxTaskMapper, transferMapper,
+        // requoteOnRelease() answers false by Mockito default, which is the shipped
+        // behaviour: the charge the approvers saw is the charge that is booked.
+        service = new CoreExecutionServiceImpl(trxTaskMapper, mock(ChargeMapper.class),
+                mock(ChargeService.class), mock(LimitService.class), transferMapper,
                 coreTransferClient, new TransferTypeProperties(), simsemPool,
                 new SimsemRefunder(coreTransferClient), txManager);
         when(coreTransferClient.isEnabled()).thenReturn(true);
@@ -155,8 +159,10 @@ class CoreExecutionServiceImplTest {
         assertThat(result.message()).isNull();
 
         // Usage incremented on exactly the locked rows (the decision: usage moves at release).
-        verify(transferMapper).incrementCorpLimitUsage("CL1", AMOUNT);
-        verify(transferMapper).incrementGroupLimitUsage("GL1", AMOUNT);
+        // The daily ceilings are consumed at SUBMIT now, as a reservation. Release must
+        // not increment them a second time, or one transfer would be counted twice.
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
 
         // BASE_FT: submit-time REF_NO kept, TRX_REF_NO minted NOW off the shared counter,
         // maker as creator, releaser as updater.
@@ -214,8 +220,8 @@ class CoreExecutionServiceImplTest {
         assertThat(kliring.getValue().intermediaryBranch()).isEqualTo("760");
 
         // Usage moves by the DEBITED total (amount + fee), mirroring the submit ladder.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("10002900"));
-        verify(transferMapper).incrementGroupLimitUsage("GL1", new BigDecimal("10002900"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
 
         ArgumentCaptor<BaseFtDomInsert> baseFt = ArgumentCaptor.forClass(BaseFtDomInsert.class);
         verify(transferMapper).insertBaseFtDom(baseFt.capture());
@@ -254,7 +260,7 @@ class CoreExecutionServiceImplTest {
         assertThat(rtgs.getValue().tsaCode()).isEqualTo("IFT00000");
         assertThat(rtgs.getValue().intermediaryBranch()).isEqualTo("760");
 
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("10030000"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
         ArgumentCaptor<BaseFtDomInsert> baseFt = ArgumentCaptor.forClass(BaseFtDomInsert.class);
         verify(transferMapper).insertBaseFtDom(baseFt.capture());
         assertThat(baseFt.getValue().ftClass()).contains("RTGSFT");
@@ -344,7 +350,7 @@ class CoreExecutionServiceImplTest {
         service.execute(TASK);
 
         // Both checks passed: the usage increment ran, i.e. we reached the core call.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", AMOUNT);
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
         verify(coreTransferClient).transfer(anyString(), anyString(), any(), anyString(), any());
     }
 
@@ -361,7 +367,7 @@ class CoreExecutionServiceImplTest {
         assertThat(result.status()).isEqualTo("FAILED");
         assertThat(result.message()).contains("Nomor rekening tidak valid.");
         // The increments DID run inside TX-B - and TX-B was rolled back, undoing them.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", AMOUNT);
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
         verify(txManager).rollback(any());
         verify(transferMapper, never()).insertBaseFt(any());
         // The FAILED verdict landed in its own transaction, with the reason in the note.
@@ -385,8 +391,8 @@ class CoreExecutionServiceImplTest {
         assertThat(result.status()).isEqualTo("UNKNOWN");
         // The transfer MAY have happened: nothing rolls back, the increments stay
         // counted until reconciliation, and no BASE_FT row pretends success.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", AMOUNT);
-        verify(transferMapper).incrementGroupLimitUsage("GL1", AMOUNT);
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
         verify(txManager, never()).rollback(any());
         verify(transferMapper, never()).insertBaseFt(any());
         verify(trxTaskMapper, never()).markExecuted(anyString(), anyString(), anyString(), anyString());
@@ -494,7 +500,7 @@ class CoreExecutionServiceImplTest {
         var result = service.execute(TASK);
 
         assertThat(result.status()).isEqualTo("EXECUTED");
-        verify(transferMapper).incrementCorpLimitUsage("CL1", AMOUNT);
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
         verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
     }
 
@@ -524,8 +530,8 @@ class CoreExecutionServiceImplTest {
         assertThat(instruction.getValue().customerRefNo()).isEqualTo("20260831100000228541");
 
         // Usage moves by amount + the 6,500 fee, like every domestic method.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("10006500"));
-        verify(transferMapper).incrementGroupLimitUsage("GL1", new BigDecimal("10006500"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
 
         ArgumentCaptor<BaseFtDomInsert> baseFt = ArgumentCaptor.forClass(BaseFtDomInsert.class);
         verify(transferMapper).insertBaseFtDom(baseFt.capture());
@@ -566,8 +572,8 @@ class CoreExecutionServiceImplTest {
         assertThat(result.status()).isEqualTo("UNKNOWN");
         assertThat(result.message()).contains("68");
         // Exactly the timeout path's semantics: increments COMMIT with the verdict.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("10006500"));
-        verify(transferMapper).incrementGroupLimitUsage("GL1", new BigDecimal("10006500"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
         verify(txManager, never()).rollback(any());
         verify(transferMapper, never()).insertBaseFtDom(any());
         verify(trxTaskMapper, never()).markExecuted(anyString(), any(), anyString(), anyString());
@@ -643,8 +649,8 @@ class CoreExecutionServiceImplTest {
         assertThat(cross.getValue().rateType()).isEqualTo("02");
 
         // Usage moves by the DEBIT side, in the debit currency's rows.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("610.50"));
-        verify(transferMapper).incrementGroupLimitUsage("GL1", new BigDecimal("610.50"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
 
         // BASE_FT keeps the InHouseFT spine; TRX_CCY_CD carries the CREDIT currency.
         ArgumentCaptor<BaseFtInsert> baseFt = ArgumentCaptor.forClass(BaseFtInsert.class);
@@ -700,7 +706,7 @@ class CoreExecutionServiceImplTest {
         assertThat(loan.getValue().toAmount()).isEqualTo("10000000.00");
         assertThat(loan.getValue().rateType()).isNull();
         // No frozen debit side: usage moves by the plain amount in the wire currency.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", AMOUNT);
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
     }
 
     @Test
@@ -797,7 +803,7 @@ class CoreExecutionServiceImplTest {
         verify(trxTaskMapper, never()).markLeg1Done(anyString(), anyString(), anyString(), anyString());
         verify(coreTransferClient, never()).transferKliring(any());
         // Usage ran inside TX-B and TX-B rolled back.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", DEBIT_USD);
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
         verify(txManager).rollback(any());
         verify(trxTaskMapper).markExecutionOutcome(TASK, "FAILED", "CU9");
         verify(trxTaskMapper, never()).updateTwoLegState(anyString(), anyString(), anyString());
@@ -855,8 +861,8 @@ class CoreExecutionServiceImplTest {
         assertThat(kliring.getValue().senderName()).isEqualTo("PT DEMO TRANSAKSI");
         assertThat(kliring.getValue().beneficiaryAccount()).isEqualTo("3049530495");
         // Usage moved by the DEBIT side in USD.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", DEBIT_USD);
-        verify(transferMapper).incrementGroupLimitUsage("GL1", DEBIT_USD);
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
         // BASE_FT: the leg-2 outward row carries the customer's account, the simsem and leg 1's journal.
         ArgumentCaptor<BaseFtDomInsert> baseFt = ArgumentCaptor.forClass(BaseFtDomInsert.class);
         verify(transferMapper).insertBaseFtDom(baseFt.capture());
@@ -936,7 +942,7 @@ class CoreExecutionServiceImplTest {
         assertThat(result.status()).isEqualTo("UNKNOWN");
         assertThat(result.message()).contains("tertahan").contains(SIMSEM).contains("J1");
         verify(txManager, never()).rollback(any());
-        verify(transferMapper).incrementCorpLimitUsage("CL1", DEBIT_USD);
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
         verify(trxTaskMapper).markExecutionOutcome(TASK, "UNKNOWN", "CU9");
         verify(trxTaskMapper).updateTwoLegState(TASK, "REFUND_FAILED", "CU9");
         verify(transferMapper, never()).insertBaseFtDom(any());
@@ -1037,8 +1043,8 @@ class CoreExecutionServiceImplTest {
         assertThat(va.getValue().inquiryRequestId()).isEqualTo("INQ-123");
 
         // Usage moves by the debited total (amount + fee), like every flat-fee type.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("153000"));
-        verify(transferMapper).incrementGroupLimitUsage("GL1", new BigDecimal("153000"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
 
         // The legacy VA record, not BASE_FT: principal, total, fee, both references.
         ArgumentCaptor<VaFtInsert> row = ArgumentCaptor.forClass(VaFtInsert.class);
@@ -1097,7 +1103,7 @@ class CoreExecutionServiceImplTest {
         var result = service.execute(TASK);
 
         assertThat(result.status()).isEqualTo("UNKNOWN");
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("153000"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
         verify(txManager, never()).rollback(any());
         verify(transferMapper, never()).insertVirtualAccountFt(any());
         verify(trxTaskMapper).markExecutionOutcome(TASK, "UNKNOWN", "CU9");
@@ -1186,8 +1192,8 @@ class CoreExecutionServiceImplTest {
         assertThat(sent.getValue().proxyValue()).isNull();
 
         // Usage moves by amount + fee like every flat-fee domestic type.
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("126499"));
-        verify(transferMapper).incrementGroupLimitUsage("GL1", new BigDecimal("126499"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
+        verify(transferMapper, never()).incrementGroupLimitUsage(anyString(), any());
 
         ArgumentCaptor<BaseFtDomInsert> row = ArgumentCaptor.forClass(BaseFtDomInsert.class);
         verify(transferMapper).insertBaseFtDom(row.capture());
@@ -1239,7 +1245,7 @@ class CoreExecutionServiceImplTest {
         var result = service.execute(TASK);
 
         assertThat(result.status()).isEqualTo("UNKNOWN");
-        verify(transferMapper).incrementCorpLimitUsage("CL1", new BigDecimal("126499"));
+        verify(transferMapper, never()).incrementCorpLimitUsage(anyString(), any());
         verify(txManager, never()).rollback(any());
         verify(transferMapper, never()).insertBaseFtDom(any());
         verify(trxTaskMapper).updateBiFastResult(TASK, "20250925BNINIDJA01075210687",

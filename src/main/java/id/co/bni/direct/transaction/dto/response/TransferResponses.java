@@ -155,7 +155,40 @@ public final class TransferResponses {
             String trxId,
             String endToEndId,
             String transactionPurpose,
-            String vaTrxType) {
+            String vaTrxType,
+            /**
+             * The charge, itemised. {@code fees} carries one entry per component of the
+             * legacy charge matrix (an LLG transfer is priced as Transfer Fee plus LLG
+             * Fee, not as one number), {@code totalFee} their IDR total, {@code chargeTo}
+             * who pays, and {@code totalDebited} what actually leaves the source account -
+             * which on {@code BENEFICIARY} is the principal alone, because the fee comes
+             * off the credit side instead. All null on tasks submitted before the charge
+             * engine; {@code feeAmount} and {@code totalAmount} above stay as they were.
+             */
+            String chargeTo,
+            List<ChargeComponentResponse> fees,
+            MoneyResponse totalFee,
+            MoneyResponse totalDebited) {
+    }
+
+    /**
+     * One charge component. {@code amount} is the tariff in its own currency and
+     * {@code amountIdr} the baseline figure the totals are built from; {@code fxRate} and
+     * {@code fxRateType} are null whenever the tariff is already IDR, which in the live
+     * data is every domestic transfer charge. Both sides travel so a screen can show
+     * "USD 1,00 (Rp15.500)" instead of a converted number with no provenance.
+     */
+    public record ChargeComponentResponse(
+            String code,
+            String label,
+            MoneyResponse amount,
+            BigDecimal amountIdr,
+            BigDecimal fxRate,
+            String fxRateType) {
+    }
+
+    /** Money envelope for the charge block: an amount and its currency. */
+    public record MoneyResponse(BigDecimal amount, String currency) {
     }
 
     /**
@@ -207,7 +240,15 @@ public final class TransferResponses {
             String estimatedDuration) {
     }
 
-    /** One workflow stage. {@code approvalLevel} null means any level qualifies. */
+    /**
+     * One workflow stage. {@code approvalLevel} null means any level qualifies.
+     *
+     * <p>{@code label} and {@code pendingCandidates} are additive: the display name is
+     * built server-side ({@code "Approval 1"} / {@code "Rilis"}) so no consumer has to
+     * learn the naming rule, and {@code pendingCandidates} - who the stage is still
+     * waiting on - is filled only for the ACTIVE stage of the view-only ladder in
+     * Aktivitas Transaksi, null everywhere else including the approval screen.
+     */
     public record StageResponse(
             Integer seqNo,
             String stageType,
@@ -216,7 +257,25 @@ public final class TransferResponses {
             Integer requiredCount,
             Integer completedCount,
             String status,
-            List<StageActionResponse> actions) {
+            List<StageActionResponse> actions,
+            String label,
+            PendingCandidatesResponse pendingCandidates) {
+
+        /** The pre-label shape the approval screen builds; label and candidates absent. */
+        public StageResponse(Integer seqNo, String stageType, String approvalLevel,
+                             String groupOption, Integer requiredCount, Integer completedCount,
+                             String status, List<StageActionResponse> actions) {
+            this(seqNo, stageType, approvalLevel, groupOption, requiredCount, completedCount,
+                    status, actions, null, null);
+        }
+    }
+
+    /**
+     * Who a stage is still waiting on. {@code names} is capped (the service truncates);
+     * {@code totalCount} is how many there really are, so a screen can render
+     * "dan 3 lainnya" without a second call.
+     */
+    public record PendingCandidatesResponse(List<String> names, int totalCount) {
     }
 
     /** One action taken inside a stage (APPROVE / REJECT / RELEASE). */

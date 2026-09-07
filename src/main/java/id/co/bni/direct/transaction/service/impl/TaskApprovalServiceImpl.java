@@ -1,8 +1,11 @@
 package id.co.bni.direct.transaction.service.impl;
 
 import id.co.bni.direct.transaction.dto.request.TaskRequests.ApproveTaskRequest;
+import id.co.bni.direct.transaction.dto.request.TaskRequests.BulkActionRequest;
 import id.co.bni.direct.transaction.dto.request.TaskRequests.RejectTaskRequest;
 import id.co.bni.direct.transaction.dto.request.TransferRequests.OtpRequest;
+import id.co.bni.direct.transaction.dto.response.TaskResponses.BulkActionResponse;
+import id.co.bni.direct.transaction.dto.response.TaskResponses.BulkResultResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.InboxItemResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.InboxResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.MyStageResponse;
@@ -11,19 +14,25 @@ import id.co.bni.direct.transaction.entity.TrxTaskRows.ActionInsert;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.CandidateRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.StageRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.TaskRow;
+import id.co.bni.direct.transaction.exception.BulkAbortedException;
 import id.co.bni.direct.transaction.exception.BusinessRuleException;
 import id.co.bni.direct.transaction.exception.NotFoundException;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient;
+import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
 import id.co.bni.direct.transaction.service.ExecutionService;
+import id.co.bni.direct.transaction.service.LimitService;
 import id.co.bni.direct.transaction.service.TaskApprovalService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
 
@@ -46,21 +55,31 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
     private static final Logger log = LoggerFactory.getLogger(TaskApprovalServiceImpl.class);
 
     private final TrxTaskMapper trxTaskMapper;
+    private final TransferMapper transferMapper;
+    private final LimitService limitService;
     private final UmasAuthenticatorClient authenticatorClient;
     private final ExecutionService executionService;
     private final ExecutionOutbox executionOutbox;
     private final TransactionTemplate workflowTransaction;
+    /** Configurable rather than a constant so it can be lowered without a release. */
+    private final int bulkMaxSize;
 
     public TaskApprovalServiceImpl(TrxTaskMapper trxTaskMapper,
+                                   TransferMapper transferMapper,
+                                   LimitService limitService,
                                    UmasAuthenticatorClient authenticatorClient,
                                    ExecutionService executionService,
                                    ExecutionOutbox executionOutbox,
-                                   PlatformTransactionManager transactionManager) {
+                                   PlatformTransactionManager transactionManager,
+                                   @Value("${app.tasks.bulk-max-size:50}") int bulkMaxSize) {
         this.trxTaskMapper = trxTaskMapper;
+        this.transferMapper = transferMapper;
+        this.limitService = limitService;
         this.authenticatorClient = authenticatorClient;
         this.executionService = executionService;
         this.executionOutbox = executionOutbox;
         this.workflowTransaction = new TransactionTemplate(transactionManager);
+        this.bulkMaxSize = bulkMaxSize;
     }
 
     @Override
@@ -104,6 +123,18 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
     private String approveInTransaction(String companyId, String actor, String taskId,
                                         ApproveTaskRequest request) {
         Acting acting = checkActionable(companyId, taskId, request.userId(), request.otp());
+        return applyApprove(companyId, actor, acting, request.userId(), request.note());
+    }
+
+    /**
+     * The approve/release write itself, over an {@link Acting} whose checks have already
+     * passed. Both the single-task path and the batch path go through this one method, so
+     * the stage arithmetic - and the decision of what the task's next status is - exists
+     * exactly once.
+     */
+    private String applyApprove(String companyId, String actor, Acting acting,
+                                String userId, String note) {
+        String taskId = acting.task().id();
         TaskRow task = acting.task();
         StageRow stage = acting.stage();
 
@@ -137,15 +168,15 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
         }
 
         String action = "RELEASE".equals(stage.stageType()) ? "RELEASE" : "APPROVE";
-        insertAction(taskId, stage.seqNo(), action, request.userId(), acting.candidate(),
-                acting.otpVerificationId(), request.note());
+        insertAction(taskId, stage.seqNo(), action, userId, acting.candidate(),
+                acting.otpVerificationId(), note);
         trxTaskMapper.updateStageProgress(taskId, stage.seqNo(), newCompleted,
                 stageDone ? "DONE" : "ACTIVE", actor);
         if (nextStage != null) {
             trxTaskMapper.updateStageStatus(taskId, nextStage.seqNo(), "ACTIVE", actor);
         }
 
-        log.info("Task {} {} by {}: status {} -> {}", taskId, action, request.userId(),
+        log.info("Task {} {} by {}: status {} -> {}", taskId, action, userId,
                 task.status(), newStatus);
         return newStatus;
     }
@@ -155,19 +186,180 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
     public TaskActionResponse reject(String companyId, String actor, String taskId,
                                      RejectTaskRequest request) {
         Acting acting = checkActionable(companyId, taskId, request.userId(), request.otp());
-
-        claimOrConflict(taskId, acting.task().version(), "REJECTED", null, actor);
-        insertAction(taskId, acting.stage().seqNo(), "REJECT", request.userId(),
-                acting.candidate(), acting.otpVerificationId(), request.note());
-        trxTaskMapper.closeOpenStages(taskId, actor);
-
-        log.info("Task {} REJECTED by {}", taskId, request.userId());
+        applyReject(companyId, actor, acting, request.userId(), request.note());
         return new TaskActionResponse(taskId, "REJECTED");
+    }
+
+    /**
+     * The reject write, shared by the single-task and batch paths.
+     *
+     * <p>A rejected task will never execute, so the daily ceiling it reserved at submit is
+     * given back here. Doing it anywhere later would leave a company unable to spend a
+     * limit that nothing is going to consume.
+     */
+    private void applyReject(String companyId, String actor, Acting acting, String userId, String note) {
+        String taskId = acting.task().id();
+        claimOrConflict(taskId, acting.task().version(), "REJECTED", null, actor);
+        releaseReservation(companyId, acting.task());
+        insertAction(taskId, acting.stage().seqNo(), "REJECT", userId,
+                acting.candidate(), acting.otpVerificationId(), note);
+        trxTaskMapper.closeOpenStages(taskId, actor);
+        log.info("Task {} REJECTED by {}", taskId, userId);
+    }
+
+    // ------------------------------------------------------------------ batch
+
+    /**
+     * Approve many tasks at once. All-or-nothing: every selected task is checked first,
+     * and one refusal aborts the whole batch with nothing written.
+     */
+    @Override
+    public BulkActionResponse bulkApprove(String companyId, String actor, BulkActionRequest request) {
+        return bulk(companyId, actor, request, "APPROVAL", "APPROVE");
+    }
+
+    /** Release many tasks at once; same contract as {@link #bulkApprove}. */
+    @Override
+    public BulkActionResponse bulkRelease(String companyId, String actor, BulkActionRequest request) {
+        return bulk(companyId, actor, request, "RELEASE", "RELEASE");
+    }
+
+    /** Reject many tasks at once. The note saying why is required and shared by all of them. */
+    @Override
+    public BulkActionResponse bulkReject(String companyId, String actor, BulkActionRequest request) {
+        if (request.note() == null || request.note().isBlank()) {
+            throw new BusinessRuleException("NOTE_REQUIRED", "Alasan penolakan wajib diisi.");
+        }
+        return bulk(companyId, actor, request, null, "REJECT");
+    }
+
+    /**
+     * The batch pipeline, in the order that decides whether a failed batch costs the user
+     * a token:
+     *
+     * <ol>
+     *   <li>shape checks (size, duplicates) - no database at all;</li>
+     *   <li>eligibility of EVERY task, collecting all failures instead of stopping;</li>
+     *   <li>abort here if anything failed - the OTP has not been touched;</li>
+     *   <li>verify the OTP ONCE;</li>
+     *   <li>apply the action to every task, all inside one transaction.</li>
+     * </ol>
+     *
+     * <p>Step 3 is the whole point of the ordering. Verification happens at UMAS, outside
+     * this transaction, and a rollback cannot give a spent token back - so a batch that was
+     * never going to succeed must be refused before that hop, not after it.
+     *
+     * <p>Ids are sorted before processing so two overlapping batches always touch tasks in
+     * the same order. Concurrency itself is still settled by the optimistic claim every
+     * write makes (WHERE VERSION = the version read): a task another actor moved in
+     * between fails the claim, the exception rolls the whole batch back, and the user is
+     * told to reload. That is deliberately preferred over row locks, which on this access
+     * pattern would trade a clear "someone else acted" message for a deadlock.
+     */
+    private BulkActionResponse bulk(String companyId, String actor, BulkActionRequest request,
+                                    String requiredStageType, String action) {
+        List<String> taskIds = validatedIds(request.taskIds());
+        if (!request.isDryRun() && request.otp() == null) {
+            throw new BusinessRuleException("OTP_REQUIRED", "Verifikasi token wajib diisi.");
+        }
+
+        List<BulkResultResponse> results = workflowTransaction.execute(tx -> {
+            List<Acting> actings = new ArrayList<>();
+            List<BulkAbortedException.Failure> failures = new ArrayList<>();
+            for (String taskId : taskIds) {
+                try {
+                    actings.add(checkEligible(companyId, taskId, request.userId(), requiredStageType));
+                } catch (NotFoundException ex) {
+                    failures.add(new BulkAbortedException.Failure(taskId, null,
+                            "TASK_NOT_FOUND", ex.getMessage()));
+                } catch (BusinessRuleException ex) {
+                    failures.add(new BulkAbortedException.Failure(taskId, null,
+                            ex.code(), ex.getMessage()));
+                }
+            }
+            if (!failures.isEmpty()) {
+                log.info("Bulk {} aborted for {}: {} of {} tasks refused", action,
+                        request.userId(), failures.size(), taskIds.size());
+                throw new BulkAbortedException(failures);
+            }
+            if (request.isDryRun()) {
+                // Nothing is written and no token is spent; the caller only wanted to know
+                // whether the selection would go through. Reported statuses are current.
+                return actings.stream()
+                        .map(a -> new BulkResultResponse(a.task().id(), a.task().refNo(), a.task().status()))
+                        .toList();
+            }
+
+            String verificationId = verifyOtp(request.userId(), request.otp());
+            List<BulkResultResponse> applied = new ArrayList<>();
+            for (Acting eligible : actings) {
+                Acting acting = eligible.withOtp(verificationId);
+                String status;
+                if ("REJECT".equals(action)) {
+                    applyReject(companyId, actor, acting, request.userId(), request.note());
+                    status = "REJECTED";
+                } else {
+                    status = applyApprove(companyId, actor, acting, request.userId(), request.note());
+                }
+                applied.add(new BulkResultResponse(acting.task().id(), acting.task().refNo(), status));
+            }
+            return applied;
+        });
+
+        List<BulkResultResponse> finalResults = request.isDryRun()
+                ? results
+                : results.stream().map(this::executeIfReady).toList();
+        log.info("Bulk {} by {}: {} tasks{}", action, request.userId(), finalResults.size(),
+                request.isDryRun() ? " (dry run)" : "");
+        return new BulkActionResponse(taskIds.size(),
+                request.isDryRun() ? 0 : finalResults.size(),
+                request.isDryRun(), finalResults);
+    }
+
+    /**
+     * A released task whose workflow is complete goes to the execution seam - AFTER the
+     * batch has committed, exactly as the single-task path does it, because the seam opens
+     * its own transaction against the same row.
+     *
+     * <p>An execution that fails here does NOT undo the batch, and must not: the approvals
+     * happened and are recorded; what failed is the instruction, which is a per-transaction
+     * outcome the row itself carries. In kafka mode the task is already QUEUED and this is
+     * a no-op.
+     */
+    private BulkResultResponse executeIfReady(BulkResultResponse result) {
+        if (!"READY_TO_EXECUTE".equals(result.status())) {
+            return result;
+        }
+        ExecutionService.ExecutionResult executed = executionService.execute(result.taskId());
+        return new BulkResultResponse(result.taskId(), result.refNo(), executed.status());
+    }
+
+    /** Shape checks that need no database: batch size and duplicate ids. */
+    private List<String> validatedIds(List<String> taskIds) {
+        if (taskIds == null || taskIds.isEmpty()) {
+            throw new BusinessRuleException("TASK_IDS_REQUIRED", "Pilih minimal satu transaksi.");
+        }
+        if (taskIds.size() > bulkMaxSize) {
+            throw new BusinessRuleException("BATCH_TOO_LARGE",
+                    "Maksimal " + bulkMaxSize + " transaksi dalam satu proses.");
+        }
+        // A repeated id is a caller bug, not something to quietly de-duplicate: the second
+        // occurrence would fail ALREADY_ACTED anyway and abort the batch with a confusing
+        // reason. Say what is actually wrong instead.
+        if (new HashSet<>(taskIds).size() != taskIds.size()) {
+            throw new BusinessRuleException("DUPLICATE_TASK_ID",
+                    "Ada transaksi yang terpilih lebih dari satu kali.");
+        }
+        return taskIds.stream().sorted().toList();
     }
 
     /** Everything both actions establish before writing anything. */
     private record Acting(TaskRow task, List<StageRow> stages, StageRow stage,
                           CandidateRow candidate, String otpVerificationId) {
+
+        Acting withOtp(String verificationId) {
+            return new Acting(task, stages, stage, candidate, verificationId);
+        }
     }
 
     /**
@@ -177,6 +369,26 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
      */
     private Acting checkActionable(String companyId, String taskId, String userId,
                                    OtpRequest otp) {
+        Acting eligible = checkEligible(companyId, taskId, userId, null);
+        return eligible.withOtp(verifyOtp(userId, otp));
+    }
+
+    /**
+     * Everything checkActionable establishes EXCEPT the OTP: the task exists, is on an
+     * actionable stage of the expected type, and this user is a frozen candidate who has
+     * not acted yet.
+     *
+     * <p>Split out for the batch path, where the token must be spent once and only after
+     * every selected task has passed - verifying first and failing later would burn a
+     * token the user then has to re-issue just to be told a row was stale. The single-task
+     * path calls it through checkActionable and behaves exactly as before.
+     *
+     * <p>{@code requiredStageType} pins which kind of stage the caller is acting on
+     * (APPROVAL for approve, RELEASE for release); null accepts whichever stage is active,
+     * which is what the single-task endpoint and reject do.
+     */
+    private Acting checkEligible(String companyId, String taskId, String userId,
+                                 String requiredStageType) {
         TaskRow task = trxTaskMapper.findTask(companyId, taskId);
         if (task == null) {
             throw new NotFoundException("Transaksi tidak ditemukan.");
@@ -201,6 +413,15 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
             throw new BusinessRuleException("TASK_NOT_ACTIONABLE",
                     "Transaksi ini tidak dapat diproses pada status saat ini.");
         }
+        // The batch endpoints are one action each, so a task sitting on the OTHER kind of
+        // stage is refused by name rather than silently doing the other thing to it: a
+        // user who selected twenty rows must not have some approved and some released.
+        if (requiredStageType != null && !requiredStageType.equals(stage.stageType())) {
+            throw new BusinessRuleException("STAGE_MISMATCH",
+                    "RELEASE".equals(stage.stageType())
+                            ? "Transaksi ini sedang menunggu rilis, bukan persetujuan."
+                            : "Transaksi ini sedang menunggu persetujuan, bukan rilis.");
+        }
 
         CandidateRow candidate = trxTaskMapper.findCandidate(taskId, stage.seqNo(), userId);
         if (candidate == null) {
@@ -211,14 +432,31 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
             throw new BusinessRuleException("ALREADY_ACTED",
                     "Anda sudah memproses transaksi ini.");
         }
+        return new Acting(task, stages, stage, candidate, null);
+    }
 
+    /** The token hop, kept separate so a batch can spend one verification for many tasks. */
+    private String verifyOtp(String userId, OtpRequest otp) {
         UmasAuthenticatorClient.Verification verification = authenticatorClient
                 .verifyTransaction(userId, otp.challenge(), otp.response());
         if (!verification.verified()) {
             throw new BusinessRuleException("OTP_INVALID",
                     "Kode OTP tidak valid atau sudah kedaluwarsa.");
         }
-        return new Acting(task, stages, stage, candidate, verification.verificationId());
+        return verification.verificationId();
+    }
+
+    /**
+     * Give the task's limit reservation back. Silent when the task reserved nothing - an
+     * older task, or a transfer no ceiling row applied to.
+     */
+    private void releaseReservation(String companyId, TaskRow task) {
+        if (task.lmtSrvcCcyMtrxId() == null || task.lmtReservedAmt() == null) {
+            return;
+        }
+        limitService.release(companyId, transferMapper.findUserGroupId(task.makerUserId()),
+                task.srvcCd(), new LimitService.Reservation(task.lmtSrvcCcyMtrxId(),
+                        task.lmtCcyMtrxCd(), task.lmtCcyCd(), task.lmtReservedAmt()));
     }
 
     /** The optimistic claim; 0 rows = a concurrent actor won, nothing is written. */

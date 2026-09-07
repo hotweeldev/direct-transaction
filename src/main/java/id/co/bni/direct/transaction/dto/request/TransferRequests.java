@@ -80,7 +80,41 @@ public final class TransferRequests {
             String proxyType,
             String proxyValue,
             @Valid BiFastCreditorRequest bifastCreditor,
-            @Valid VaBillRequest vaBill) {
+            @Valid VaBillRequest vaBill,
+            /**
+             * Who the charge is billed to: {@code "REMITTER"} (the default, and what an
+             * absent field means) or {@code "BENEFICIARY"}, where the fee comes off the
+             * credit side and the sender is debited the principal alone.
+             */
+            String chargeTo) {
+
+        /** The pre-charge-engine shape (everything but the charge bearer). */
+        public SubmitTransferRequest(String userId, String sourceAccountNo,
+                                     String beneficiaryAccountNo, String beneficiaryName,
+                                     MoneyRequest amount, String remark, OtpRequest otp,
+                                     String transferType, String beneficiaryBankId,
+                                     String beneficiaryAddress1, String beneficiaryAddress2,
+                                     String beneficiaryAddress3, String beneficiaryPhone,
+                                     String beneficiaryPostalCode, String beneficiaryIdType,
+                                     String beneficiaryIdNumber, String beneficiaryType,
+                                     String remitterResidencyCode, String beneficiaryResidencyCode,
+                                     String beneficiaryCurrency, BigDecimal debitAmount,
+                                     String rateType, String underlyingDocType,
+                                     String underlyingDocNumber, String underlyingDocName,
+                                     BigDecimal underlyingDocAmount, String underlyingDocExpiry,
+                                     String inquiryRequestId, String transactionPurpose,
+                                     String proxyType, String proxyValue,
+                                     BiFastCreditorRequest bifastCreditor, VaBillRequest vaBill) {
+            this(userId, sourceAccountNo, beneficiaryAccountNo, beneficiaryName, amount,
+                    remark, otp, transferType, beneficiaryBankId, beneficiaryAddress1,
+                    beneficiaryAddress2, beneficiaryAddress3, beneficiaryPhone,
+                    beneficiaryPostalCode, beneficiaryIdType, beneficiaryIdNumber,
+                    beneficiaryType, remitterResidencyCode, beneficiaryResidencyCode,
+                    beneficiaryCurrency, debitAmount, rateType, underlyingDocType,
+                    underlyingDocNumber, underlyingDocName, underlyingDocAmount,
+                    underlyingDocExpiry, inquiryRequestId, transactionPurpose, proxyType,
+                    proxyValue, bifastCreditor, vaBill, null);
+        }
 
         /** The pre-V11 shape (everything but the echoed VA bill block). */
         public SubmitTransferRequest(String userId, String sourceAccountNo,
@@ -107,7 +141,7 @@ public final class TransferRequests {
                     beneficiaryCurrency, debitAmount, rateType, underlyingDocType,
                     underlyingDocNumber, underlyingDocName, underlyingDocAmount,
                     underlyingDocExpiry, inquiryRequestId, transactionPurpose, proxyType,
-                    proxyValue, bifastCreditor, null);
+                    proxyValue, bifastCreditor, null, null);
         }
 
         /** The pre-P7 shape (everything but the BI-Fast purpose, proxy and creditor echo). */

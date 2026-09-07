@@ -53,7 +53,8 @@ class ActivityServiceImplTest {
                 "MNU_GCME_050200", "GCM_FTR_IH_3RD", "Transfer to BNI to Third Party Account",
                 rawStatus, statusGroup, new BigDecimal("10000000"), "IDR",
                 "5930011554", "Cek", "IDR", "18000014067", "NABILA LEKSANA PUTRI", "gaji",
-                "TASK".equals(source) ? "IMMEDIATE" : "1", null, CREATED, CREATED.plusMinutes(2), "964026", "ALFAKU", null, null);
+                "TASK".equals(source) ? "IMMEDIATE" : "1", null, CREATED, CREATED.plusMinutes(2), "964026", "ALFAKU", null, null,
+                null, null, null);
     }
 
     private static ActivitySearchRequest dateSearch(LocalDate start, LocalDate end) {
@@ -84,7 +85,7 @@ class ActivityServiceImplTest {
         assertThat(f.getDateTo()).isEqualTo(LocalDate.of(2026, 9, 30));
         // the screen alias resolves to the menu code the rows carry
         assertThat(f.getMenuCd()).isEqualTo("MNU_GCME_050200");
-        assertThat(f.getStatusGroup()).isEqualTo("BERHASIL");
+        assertThat(f.getStatusGroups()).containsExactly("BERHASIL");
         assertThat(f.getSourceAccountNo()).isEqualTo("5930011554");
         assertThat(f.getBeneficiaryName()).isEqualTo("nabila");
         assertThat(f.getAmountFrom()).isEqualByComparingTo("1000");

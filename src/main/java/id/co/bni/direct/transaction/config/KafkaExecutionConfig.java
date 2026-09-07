@@ -13,7 +13,6 @@ import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.kafka.listener.CommonErrorHandler;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
-import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.util.backoff.FixedBackOff;
 
 /**
@@ -21,12 +20,13 @@ import org.springframework.util.backoff.FixedBackOff;
  * {@code app.execution.mode=kafka} - a laptop without a broker never builds a producer
  * or wakes a scheduler.
  *
- * <p>{@code @EnableScheduling} lives here for the same reason it lives on
+ * <p>{@code @EnableScheduling} moved OUT of this class to {@code SchedulingConfig}: it is
+ * needed in every execution mode now that the daily limit rebuild is scheduled, and this
+ * configuration only exists in kafka mode. Historically it lived here for the same reason it lived on
  * direct-bankmodule's UmasProvisioningScheduler: scheduling is only needed for the
  * outbox relay, so it is only switched on alongside it.
  */
 @Configuration
-@EnableScheduling
 @ConditionalOnProperty(prefix = "app.execution", name = "mode", havingValue = "kafka")
 public class KafkaExecutionConfig {
 

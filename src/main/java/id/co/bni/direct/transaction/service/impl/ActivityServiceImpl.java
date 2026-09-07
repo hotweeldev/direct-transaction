@@ -6,9 +6,14 @@ import id.co.bni.direct.transaction.dto.response.ActivityResponses.ActivityItemR
 import id.co.bni.direct.transaction.dto.response.ActivityResponses.ActivityPageResponse;
 import id.co.bni.direct.transaction.dto.response.ActivityResponses.ActivityRecentResponse;
 import id.co.bni.direct.transaction.dto.response.ActivityResponses.ActivityTrailResponse;
+import id.co.bni.direct.transaction.dto.response.ActivityResponses.WorkflowResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.PendingCandidatesResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.StageResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.StageActionResponse;
 import id.co.bni.direct.transaction.entity.ActivityRows.ActivityFilter;
 import id.co.bni.direct.transaction.entity.ActivityRows.ActivityRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ActionRow;
+import id.co.bni.direct.transaction.entity.TrxTaskRows.StageRow;
 import id.co.bni.direct.transaction.exception.BusinessRuleException;
 import id.co.bni.direct.transaction.exception.NotFoundException;
 import id.co.bni.direct.transaction.repository.mapper.ActivityMapper;
@@ -23,14 +28,18 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Aktivitas Transaksi over TRX_TASK (rewrite, every status) plus BASE_FT (legacy, executed).
  *
- * <p>The three-way status the screen shows is computed in SQL (STATUS_GROUP) so the same
- * rule serves filtering and display: EXECUTED = BERHASIL, FAILED / REJECTED = GAGAL,
- * everything still moving - including UNKNOWN, which waits for reconciliation - = DIPROSES.
- * Legacy rows are BERHASIL by construction (BASE_FT only ever held executed transfers).
+ * <p>The status the screen shows is computed in SQL (STATUS_GROUP) so the same rule serves
+ * filtering and display. Since the stage split it has SIX values, not three: the two
+ * waiting stages are their own statuses (PENDING_APPROVAL, PENDING_RELEASE), DIPROSES now
+ * means EXECUTION is under way (READY_TO_EXECUTE / QUEUED / EXECUTING, and UNKNOWN, which
+ * waits for reconciliation), EXECUTED = BERHASIL, REJECTED = DITOLAK, FAILED = GAGAL.
+ * Legacy rows are BERHASIL by construction (BASE_FT only ever held executed transfers) and
+ * can never carry a stage status.
  *
  * <p>Scope is per company, narrowed to the accounts the user holds inquiry rights on; the
  * mapper applies that, so a reference number outside the user's accounts reads as 404, the
@@ -51,6 +60,25 @@ public class ActivityServiceImpl implements ActivityService {
      */
     private static final Map<String, String> TYPE_ALIASES = Map.of(
             "TRANSFER_BNI", TransferServiceImpl.MENU_CD);
+
+    /** The two statuses whose ladder is still being walked - the only ones §6 renders. */
+    private static final List<String> IN_FLIGHT_STATUSES = List.of("PENDING_APPROVAL", "PENDING_RELEASE");
+
+    /**
+     * BACKWARD COMPATIBILITY, remove once every FE sends the six-value status.
+     *
+     * <p>Before the stage split, DIPROSES meant "anything that is neither done nor
+     * refused", which included both waiting stages. An FE built against that contract
+     * still sends status=DIPROSES for its "in progress" chip, and answering it with only
+     * the narrowed DIPROSES would silently hide every transaction awaiting approval - the
+     * worst possible failure for this screen. So the old value is expanded; the new,
+     * narrower values pass through as themselves.
+     */
+    private static final Map<String, List<String>> LEGACY_STATUS_ALIASES = Map.of(
+            "DIPROSES", List.of("PENDING_APPROVAL", "PENDING_RELEASE", "DIPROSES"));
+
+    /** How many "menunggu siapa" names a stage sends before it just counts them. */
+    private static final int MAX_PENDING_CANDIDATE_NAMES = 10;
 
     private final ActivityMapper activityMapper;
     private final TrxTaskMapper trxTaskMapper;
@@ -103,7 +131,8 @@ public class ActivityServiceImpl implements ActivityService {
                 row.createdDt(), row.menuCd(), typeLabel(row), row.remAcctNo(), row.remAcctNm(),
                 row.remAcctCcy(), row.benAcctNo(), row.benAcctNm(), row.trxAmt(), row.trxCcyCd(),
                 row.remark1(), instruction(row), row.makerUserName(), row.journalNo(), row.trxRefNo(),
-                row.executedDt(), row.orderPartyRefNo(), row.counterPartyRefNo(), trail);
+                row.executedDt(), row.orderPartyRefNo(), row.counterPartyRefNo(), trail,
+                workflow(row));
     }
 
     // ---------------------------------------------------------------- mapping
@@ -139,7 +168,7 @@ public class ActivityServiceImpl implements ActivityService {
             String type = request.transactionType().trim();
             filter.setMenuCd(TYPE_ALIASES.getOrDefault(type, type));
         }
-        filter.setStatusGroup(blankToNull(request.status()));
+        filter.setStatusGroups(statusGroups(blankToNull(request.status())));
         filter.setSourceAccountNo(blankToNull(request.sourceAccountNo()));
         filter.setBeneficiaryName(blankToNull(request.beneficiaryName()));
         if (request.amountFrom() != null) {
@@ -158,11 +187,40 @@ public class ActivityServiceImpl implements ActivityService {
         return filter;
     }
 
+    /** One chip to the STATUS_GROUP values it covers; null (no filter) stays null. */
+    public static List<String> statusGroups(String status) {
+        if (status == null) {
+            return null;
+        }
+        return LEGACY_STATUS_ALIASES.getOrDefault(status, List.of(status));
+    }
+
     static ActivityItemResponse toItem(ActivityRow row) {
         return new ActivityItemResponse(row.refNo(), row.source(), row.createdDt(), row.menuCd(),
                 typeLabel(row), row.remAcctNo(), row.remAcctNm(), row.remAcctCcy(), row.benAcctNo(),
                 row.benAcctNm(), row.trxAmt(), row.trxCcyCd(), instruction(row), row.statusGroup(),
-                row.rawStatus(), row.orderPartyRefNo(), row.counterPartyRefNo(), null);
+                row.rawStatus(), row.orderPartyRefNo(), row.counterPartyRefNo(), null,
+                stageProgress(row));
+    }
+
+    /**
+     * "Approval 1 dari 2" / "Rilis" - where a waiting transaction stands, without opening
+     * the detail. Null unless the row is a task actually waiting on a stage: a legacy row
+     * has no stage columns at all, and a task past release has nothing left to wait for.
+     */
+    public static String stageProgress(ActivityRow row) {
+        if (!IN_FLIGHT_STATUSES.contains(row.statusGroup())
+                || row.currentStageSeq() == null || row.currentStageType() == null) {
+            return null;
+        }
+        if ("RELEASE".equals(row.currentStageType())) {
+            return "Rilis";
+        }
+        int total = row.approvalStageCount() == null ? 0 : row.approvalStageCount();
+        // The approval stages come first, so the sequence number IS the approval ordinal.
+        return total > 1
+                ? "Approval " + row.currentStageSeq() + " dari " + total
+                : "Approval";
     }
 
     /** The menu's display name when this service knows it, else core's service name. */
@@ -210,12 +268,66 @@ public class ActivityServiceImpl implements ActivityService {
                 transactionStatus = row.statusGroup();
                 activityStatus = "BERHASIL".equals(row.statusGroup()) ? "SUKSES" : "GAGAL";
             } else if ("REJECT".equals(type)) {
-                transactionStatus = "GAGAL";
+                transactionStatus = "DITOLAK";
             }
             trail.add(new ActivityTrailResponse(action.createdDt(), type, actor,
                     row.trxAmt(), row.trxCcyCd(), activityStatus, action.note(), transactionStatus));
         }
         return trail;
+    }
+
+    /**
+     * The view-only ladder, built only for a transaction still walking it. Everything else
+     * - executed, refused, failed, and every legacy/VA row - answers null: a finished
+     * transaction's story is the activity trail, and a ladder frozen at its last state
+     * would invite the reader to think something is still pending.
+     *
+     * <p>Read-only by construction: it reports stages, actions and who is being waited on,
+     * and deliberately carries no flag saying whether THIS reader may act. The inbox
+     * answers that question, and the action endpoints enforce it regardless.
+     */
+    private WorkflowResponse workflow(ActivityRow row) {
+        if (!"TASK".equals(row.source()) || row.taskId() == null
+                || !IN_FLIGHT_STATUSES.contains(row.statusGroup())) {
+            return null;
+        }
+        Map<Integer, List<StageActionResponse>> actionsByStage = trxTaskMapper.findActions(row.taskId()).stream()
+                .filter(a -> a.stageSeq() != null)
+                .collect(Collectors.groupingBy(ActionRow::stageSeq,
+                        Collectors.mapping(a -> new StageActionResponse(
+                                        a.actorUserName(), a.action(), a.note(), a.createdDt()),
+                                Collectors.toList())));
+        List<StageRow> stageRows = trxTaskMapper.findStages(row.taskId());
+        int approvalStages = (int) stageRows.stream().filter(st -> "APPROVAL".equals(st.stageType())).count();
+        List<StageResponse> stages = new ArrayList<>();
+        int approvalOrdinal = 0;
+        for (StageRow st : stageRows) {
+            String label;
+            if ("APPROVAL".equals(st.stageType())) {
+                approvalOrdinal++;
+                label = approvalStages > 1 ? "Approval " + approvalOrdinal : "Approval";
+            } else {
+                label = "Rilis";
+            }
+            stages.add(new StageResponse(st.seqNo(), st.stageType(), st.aprvLvlCd(),
+                    st.usrGrpOpt(), st.requiredCount(), st.completedCount(), st.status(),
+                    actionsByStage.getOrDefault(st.seqNo(), List.of()),
+                    label,
+                    "ACTIVE".equals(st.status()) ? pendingCandidates(row.taskId(), st.seqNo()) : null));
+        }
+        return new WorkflowResponse(row.currentStageSeq(), approvalStages, stages);
+    }
+
+    /** Who the ACTIVE stage is still waiting on, capped; totalCount is the real number. */
+    private PendingCandidatesResponse pendingCandidates(String taskId, Integer stageSeq) {
+        List<String> names = trxTaskMapper.findPendingCandidateNames(taskId, stageSeq);
+        if (names.isEmpty()) {
+            return null;
+        }
+        List<String> shown = names.size() > MAX_PENDING_CANDIDATE_NAMES
+                ? names.subList(0, MAX_PENDING_CANDIDATE_NAMES)
+                : names;
+        return new PendingCandidatesResponse(List.copyOf(shown), names.size());
     }
 
     /** A legacy row carries no workflow history: one synthetic EXECUTE at its creation. */

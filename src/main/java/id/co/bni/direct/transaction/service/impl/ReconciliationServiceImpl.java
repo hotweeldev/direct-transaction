@@ -18,6 +18,7 @@ import id.co.bni.direct.transaction.integration.CoreTransferClient.Posting;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.TransferOutcome;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
+import id.co.bni.direct.transaction.service.LimitService;
 import id.co.bni.direct.transaction.service.ReconciliationService;
 import id.co.bni.direct.transaction.service.TransferType;
 import org.slf4j.Logger;
@@ -83,6 +84,7 @@ public class ReconciliationServiceImpl implements ReconciliationService {
     public static final String OUTCOME_NOOP = "NOOP";
 
     private final TrxTaskMapper trxTaskMapper;
+    private final LimitService limitService;
     private final TransferMapper transferMapper;
     private final CoreTransferClient coreTransferClient;
     private final SimsemRefunder simsemRefunder;
@@ -90,12 +92,14 @@ public class ReconciliationServiceImpl implements ReconciliationService {
     private final TransactionTemplate ownTransaction;
 
     public ReconciliationServiceImpl(TrxTaskMapper trxTaskMapper,
+                                     LimitService limitService,
                                      TransferMapper transferMapper,
                                      CoreTransferClient coreTransferClient,
                                      SimsemRefunder simsemRefunder,
                                      TransferTypeProperties transferTypeProperties,
                                      PlatformTransactionManager transactionManager) {
         this.trxTaskMapper = trxTaskMapper;
+        this.limitService = limitService;
         this.transferMapper = transferMapper;
         this.coreTransferClient = coreTransferClient;
         this.simsemRefunder = simsemRefunder;
@@ -242,6 +246,18 @@ public class ReconciliationServiceImpl implements ReconciliationService {
                         "Transaksi sudah direkonsiliasi oleh proses lain.");
             }
             insertAction(task, actor, note);
+            // The reservation an UNKNOWN task held is settled here, and only here: the
+            // ceiling was kept consumed precisely until this moment. FAILED means the
+            // refund landed and the money is back, so the headroom comes back with it;
+            // any other landing means the funds did move or are still unaccounted for, and
+            // the ceiling stays spent.
+            if ("FAILED".equals(status) && task.lmtSrvcCcyMtrxId() != null
+                    && task.lmtReservedAmt() != null) {
+                limitService.release(task.corpId(),
+                        transferMapper.findUserGroupId(task.makerUserId()), task.srvcCd(),
+                        new LimitService.Reservation(task.lmtSrvcCcyMtrxId(),
+                                task.lmtCcyMtrxCd(), task.lmtCcyCd(), task.lmtReservedAmt()));
+            }
             log.warn("Task {} reconciled to {} ({}): {}", task.id(), status, twoLegState, note);
             return new ReconcileResponse(task.id(), status, twoLegState, outcome, note);
         });

@@ -58,7 +58,7 @@ class ReconciliationServiceImplTest {
         trxTaskMapper = mock(TrxTaskMapper.class);
         transferMapper = mock(TransferMapper.class);
         coreTransferClient = mock(CoreTransferClient.class);
-        service = new ReconciliationServiceImpl(trxTaskMapper, transferMapper, coreTransferClient,
+        service = new ReconciliationServiceImpl(trxTaskMapper, mock(LimitService.class), transferMapper, coreTransferClient,
                 new SimsemRefunder(coreTransferClient), new TransferTypeProperties(),
                 mock(PlatformTransactionManager.class));
     }

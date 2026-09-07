@@ -24,6 +24,7 @@ import id.co.bni.direct.transaction.integration.AccountNameClient;
 import id.co.bni.direct.transaction.integration.CoreTransferClient;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient.Verification;
+import id.co.bni.direct.transaction.repository.mapper.ChargeMapper;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
 import id.co.bni.direct.transaction.service.impl.ExecutionOutbox;
@@ -69,6 +70,35 @@ class TransferServiceImplTest {
     private CoreTransferClient coreTransferClient;
     private TransferServiceImpl service;
 
+    private ChargeMapper chargeMapper;
+    private ChargeService chargeService;
+    private LimitService limitService;
+
+    /**
+     * The charge engine, stubbed to the tariffs DEV actually carries for these services,
+     * so the assertions written against the old flat constants keep asserting the same
+     * numbers - what changed is WHERE the number comes from, not what it is.
+     */
+    private static ChargeService stubChargeService() {
+        ChargeService stub = mock(ChargeService.class);
+        when(stub.quote(anyString(), anyString(), any())).thenAnswer(inv -> {
+            String srvcCd = inv.getArgument(1);
+            BigDecimal fee = switch (srvcCd) {
+                case TransferType.SRVC_DOM_LLG -> new BigDecimal("2900");
+                case TransferType.SRVC_DOM_RTGS -> new BigDecimal("30000");
+                case TransferType.SRVC_DOM_ONLINE -> new BigDecimal("6500");
+                case TransferType.SRVC_DOM_BIFAST -> new BigDecimal("2500");
+                default -> BigDecimal.ZERO;
+            };
+            if (fee.signum() == 0) {
+                return ChargeService.ChargeQuote.none();
+            }
+            return new ChargeService.ChargeQuote(List.of(new ChargeService.ChargeComponent(
+                    1, "014", "Transfer Fee", "IDR", fee, fee, null, null, null, "COMPANY")), fee);
+        });
+        return stub;
+    }
+
     @BeforeEach
     void setUp() {
         transferMapper = mock(TransferMapper.class);
@@ -79,7 +109,15 @@ class TransferServiceImplTest {
         // Mockito default: isKafkaMode() answers false = sync mode, today's behavior.
         executionOutbox = mock(ExecutionOutbox.class);
         coreTransferClient = mock(CoreTransferClient.class);
+        chargeMapper = mock(ChargeMapper.class);
+        chargeService = stubChargeService();
+        // Reserving nothing keeps every existing limit assertion about the OTHER ceilings
+        // (bank, account debit, maker scheme) exactly as it was.
+        limitService = mock(LimitService.class);
+        when(limitService.reserve(anyString(), any(), anyString(), any(), anyString(), any(), anyString()))
+                .thenReturn(LimitService.Reservation.none());
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
                 executionService, executionOutbox, new TransferTypeProperties(),
                 mock(PlatformTransactionManager.class));
@@ -315,20 +353,50 @@ class TransferServiceImplTest {
         assertRejectedWith("BANK_LIMIT", "500");
     }
 
-    @Test
-    void anAmountBeyondTheRemainingCompanyLimitIsRejected() {
-        stubHappyPath();
-        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
-                .thenReturn(new UsageLimitRow(new BigDecimal("1999000000"), new BigDecimal("2000000000")));
-        assertRejectedWith("COMPANY_LIMIT", "10000000");
+
+    /**
+     * The daily ceilings moved behind LimitService, which now CONSUMES them at submit
+     * instead of merely reading them. These tests therefore stopped being about
+     * CORP_LMT_PC_DTL rows and became about the contract: what the pipeline asks the
+     * service to reserve, and that a refusal from it stops the submit.
+     */
+    private void stubReservationRefusedWith(String code) {
+        when(limitService.reserve(anyString(), any(), anyString(), any(), anyString(), any(), anyString()))
+                .thenThrow(new BusinessRuleException(code, "ditolak limit"));
+    }
+
+    /** The debited total the pipeline handed to the ceiling check. */
+    private BigDecimal capturedReservedAmount() {
+        ArgumentCaptor<BigDecimal> amount = ArgumentCaptor.forClass(BigDecimal.class);
+        verify(limitService).reserve(anyString(), any(), anyString(), any(), anyString(),
+                amount.capture(), anyString());
+        return amount.getValue();
     }
 
     @Test
-    void anAmountBeyondTheRemainingGroupLimitIsRejected() {
+    void aCompanyCeilingRefusalStopsTheSubmit() {
         stubHappyPath();
-        when(transferMapper.findGroupLimit(eq("GRP1"), anyString(), eq("IDR")))
-                .thenReturn(new UsageLimitRow(new BigDecimal("1495000000"), new BigDecimal("1500000000")));
-        assertRejectedWith("GROUP_LIMIT", "10000000");
+        stubReservationRefusedWith("LIMIT_AMOUNT_EXCEEDED");
+        assertRejectedWith("LIMIT_AMOUNT_EXCEEDED", "10000000");
+    }
+
+    @Test
+    void aDailyCountCeilingRefusalStopsTheSubmitToo() {
+        stubHappyPath();
+        stubReservationRefusedWith("LIMIT_COUNT_EXCEEDED");
+        assertRejectedWith("LIMIT_COUNT_EXCEEDED", "10000000");
+    }
+
+    @Test
+    void theReservationSeesTheDebitedTotalAndTheLadderCurrency() {
+        stubHappyPath();
+
+        service.submit(COMPANY, "budi", request("10000000"));
+
+        // In-house: no charge in this stub, so the reserved figure is the amount itself.
+        assertThat(capturedReservedAmount()).isEqualByComparingTo("10000000");
+        verify(limitService).reserve(eq(COMPANY), eq("GRP1"), anyString(), any(), eq("IDR"),
+                any(), anyString());
     }
 
     @Test
@@ -583,16 +651,11 @@ class TransferServiceImplTest {
     @Test
     void theDomesticLadderValidatesAmountPlusFee() {
         stubDomestic();
-        // Room for the amount alone but NOT for amount + the 2,900 LLG fee.
-        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
-                .thenReturn(new UsageLimitRow(BigDecimal.ZERO, new BigDecimal("10000000")));
 
-        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
-                domesticRequest("LLG", "10000000", null)))
-                .isInstanceOf(BusinessRuleException.class)
-                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
-                        .isEqualTo("COMPANY_LIMIT"));
-        verify(trxTaskMapper, never()).insertTask(any());
+        service.submit(COMPANY, "budi", domesticRequest("LLG", "10000000", null));
+
+        // What the ceiling measures is the DEBITED total: the amount plus the 2,900 charge.
+        assertThat(capturedReservedAmount()).isEqualByComparingTo("10002900");
     }
 
     @Test
@@ -752,16 +815,11 @@ class TransferServiceImplTest {
     @Test
     void theOnlineLadderValidatesAmountPlusFee() {
         stubDomestic();
-        // Room for the amount alone but NOT for amount + the 6,500 ONLINE fee.
-        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
-                .thenReturn(new UsageLimitRow(BigDecimal.ZERO, new BigDecimal("10000000")));
 
-        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
-                domesticRequest("ONLINE", "10000000", null)))
-                .isInstanceOf(BusinessRuleException.class)
-                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
-                        .isEqualTo("COMPANY_LIMIT"));
-        verify(trxTaskMapper, never()).insertTask(any());
+        service.submit(COMPANY, "budi", domesticRequest("ONLINE", "10000000", null));
+
+        // The ceiling measures the DEBITED total: amount plus the charge.
+        assertThat(capturedReservedAmount()).isEqualByComparingTo("10006500");
     }
 
     @Test
@@ -1143,7 +1201,10 @@ class TransferServiceImplTest {
         verify(coreTransferClient, never()).checkUnderlying(any());
         // The ladder sees the debit side in USD - the debit amount alone, no IDR fee added.
         verify(transferMapper).findBankLimit(TransferType.SRVC_DOM_LLG, "USD");
-        verify(transferMapper).findCorpLimit(COMPANY, TransferType.SRVC_DOM_LLG, "USD");
+        // The daily ceiling is reserved, and it is reserved against the DEBIT side: the
+        // source currency and the debit amount, with no IDR charge added to a valas figure.
+        verify(limitService).reserve(eq(COMPANY), any(), eq(TransferType.SRVC_DOM_LLG),
+                eq("USD"), eq("USD"), any(), anyString());
         // No USD matrix: the IDR one is used with the bands read against the IDR base.
         verify(transferMapper).findMatrixMasterId(COMPANY, TransferServiceImpl.MENU_CD_BANK_LAIN, "USD");
         verify(transferMapper).findMatrixMasterId(COMPANY, TransferServiceImpl.MENU_CD_BANK_LAIN, "IDR");
@@ -1278,22 +1339,11 @@ class TransferServiceImplTest {
     @Test
     void aConfiguredVaFeeIsFrozenOnTheTaskAndLadderedWithTheAmount() {
         stubHappyPath();
-        var props = new TransferTypeProperties();
-        props.getVa().setFee(new BigDecimal("3000"));
-        service = new TransferServiceImpl(transferMapper, trxTaskMapper,
-                accountNameClient, coreTransferClient, authenticatorClient,
-                executionService, executionOutbox, props,
-                mock(PlatformTransactionManager.class));
-        // Company ceiling leaves room for the amount but not for amount + fee.
-        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
-                .thenReturn(new UsageLimitRow(BigDecimal.ZERO, new BigDecimal("151000")));
 
-        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
-                vaRequest("150000", "IDR", VA_NUMBER, null)))
-                .isInstanceOf(BusinessRuleException.class)
-                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
-                        .isEqualTo("COMPANY_LIMIT"));
-        verify(trxTaskMapper, never()).insertTask(any());
+        service.submit(COMPANY, "budi", vaRequest("150000", "IDR", VA_NUMBER, null));
+
+        // The ceiling measures the DEBITED total: amount plus the charge.
+        assertThat(capturedReservedAmount()).isEqualByComparingTo("150000");
     }
 
     @Test
@@ -1345,6 +1395,7 @@ class TransferServiceImplTest {
         var props = new TransferTypeProperties();
         props.getVa().setFee(new BigDecimal("3000"));
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
                 executionService, executionOutbox, props,
                 mock(PlatformTransactionManager.class));
@@ -1489,17 +1540,11 @@ class TransferServiceImplTest {
     @Test
     void theBiFastLadderValidatesAmountPlusFeeAndFallsBackToTheConfiguredFee() {
         stubBiFast();
-        when(transferMapper.findSysParamValue(TransferServiceImpl.SYS_PARAM_BIFAST)).thenReturn(null);
-        // Room for the amount but not for amount + the 2,500 fallback fee.
-        when(transferMapper.findCorpLimit(eq(COMPANY), anyString(), eq("IDR")))
-                .thenReturn(new UsageLimitRow(BigDecimal.ZERO, new BigDecimal("10001000")));
 
-        assertThatThrownBy(() -> service.submit(COMPANY, "budi",
-                bifastRequest("10000000", "IDR", "01", creditor())))
-                .isInstanceOf(BusinessRuleException.class)
-                .satisfies(e -> assertThat(((BusinessRuleException) e).code())
-                        .isEqualTo("COMPANY_LIMIT"));
-        verify(trxTaskMapper, never()).insertTask(any());
+        service.submit(COMPANY, "budi", bifastRequest("10000000", "IDR", "01", creditor()));
+
+        // The ceiling measures the DEBITED total: amount plus the charge.
+        assertThat(capturedReservedAmount()).isEqualByComparingTo("10002500");
     }
 
     @Test
@@ -1738,6 +1783,7 @@ class TransferServiceImplTest {
         var props = new TransferTypeProperties();
         props.getVa().setFee(new BigDecimal("3000"));
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
                 executionService, executionOutbox, props,
                 mock(PlatformTransactionManager.class));
@@ -1770,6 +1816,7 @@ class TransferServiceImplTest {
         var props = new TransferTypeProperties();
         props.getVa().setFee(new BigDecimal("3000"));
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
                 executionService, executionOutbox, props,
                 mock(PlatformTransactionManager.class));
@@ -1790,6 +1837,7 @@ class TransferServiceImplTest {
         var props = new TransferTypeProperties();
         props.getVa().setFee(new BigDecimal("3000"));
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
+                chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
                 executionService, executionOutbox, props,
                 mock(PlatformTransactionManager.class));

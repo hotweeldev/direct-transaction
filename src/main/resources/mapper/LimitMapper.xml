@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  The transaction-limit engine. Six of these statements read and write the legacy limit
+  chain (CORP_LMT_PC_DTL, CORP_USR_GRP_LMT, COM_LMT_PC_DTL and the COM_ST_SRVC_CCY_MTRX /
+  COM_ST_SRVC_CCY matrix all three hang off); one reads this service's own TRX_TASK (V1,
+  widened by V13). This service creates none of the legacy tables and Flyway must never
+  try - but it does WRITE two of them, which is not a contradiction: the legacy DIRECT
+  schema is the live schema of the system this application replaces, so the no-DDL rule and
+  the write path stand side by side.
+
+  Legacy columns are NVARCHAR2, so every literal compared against one is written N'...' - a
+  plain 'N' next to an NVARCHAR2 column raises ORA-12704 (character set mismatch). TRX_TASK
+  follows the same style, so the rule holds throughout this file, including the status list
+  in sumOpenTaskUsage.
+
+  A LIMIT IS PER CURRENCY COMBINATION, NOT PER CURRENCY. This is the single fact that most
+  of this file exists to get right. COM_ST_SRVC_CCY carries the SRVC_CD; COM_ST_SRVC_CCY_MTRX
+  hangs off it and carries CCY_MTRX_CD, whose values are LL (local to local), LF (local to
+  forex), FL (forex to local), FS (forex to forex, same currency) and FC (forex to forex,
+  cross). Those are CATEGORY PAIRS, not currency codes. A limit row then carries its own
+  CCY_CD, and that is a different thing again: the DENOMINATION the ceiling is stated in.
+  So the matrix cell selects WHICH ceiling applies and CCY_CD says what units it is in. An
+  amount has to be converted into CCY_CD before it is compared or added; skip that and a
+  100 USD transfer sails past an IDR ceiling every single time.
+
+  TWO CEILINGS PER ROW. MAX_AMT_LMT / AMT_LMT_USAGE are money in the row's CCY_CD;
+  MAX_OC_LMT / OC_LMT_USAGE are a transaction COUNT with no currency whatsoever. Both are
+  nullable and NULL is what means "no ceiling on this dimension". ZERO MEANS BLOCKED - the
+  permissive reading of a zero ceiling is the one mistake in this area that lets money out
+  of the bank.
+
+  CORP_USR_GRP_LMT HAS NO OCCURRENCE COLUMNS. Verified against the live schema on
+  2026-09-07: the table is ID, VERSION, MAX_AMT_LMT, AMT_LMT_USAGE, SRVC_CD, the four audit
+  columns, CCY_CD, SRVC_CCY_MTRX_ID, CORP_USR_GRP_ID - and that is all. Legacy simply never
+  gave the group ceiling a transaction count. lockGroupLimit therefore selects typed NULLs
+  into the two occurrence fields of LimitRow rather than pretending the columns exist, and
+  addGroupUsage takes the count parameter (so both ladders can be driven with one shape)
+  without writing it anywhere. Adding those columns is NOT an option: they would be DDL
+  against a legacy table.
+
+  THE PER-COMPANY ROW IS OFTEN MISSING AND MUST BE CREATED. 1,712 of 2,303 active companies
+  have no CORP_LMT_PC_DTL row for lines their package does define, because the legacy
+  procedure INJECT_LIMIT_COMPANY was never run for them. A company with no row of its own
+  has nowhere to record a reservation - the package is a template shared by everyone on it
+  and has no usage columns - so insertCorpLimitFromPackage materializes the row from the
+  package before the first reservation. That is the same copy-down the legacy procedure
+  performs, done at transaction time instead of at company setup.
+
+  DUPLICATES EXIST AND ROWNUM = 1 TOLERATES THEM. Neither limit table has a unique key
+  beyond ID (direct-bankmodule's LimitCatalogMapper documents 77 duplicated corp pairs), so
+  the resolution can match more than one row. Both lock statements take the first and carry
+  its ID out, because re-running the resolution for the update could land on a DIFFERENT
+  duplicate than the one that was locked - which would increment a row nobody holds a lock
+  on. ROWNUM rather than FETCH FIRST because Oracle refuses FOR UPDATE over a row-limiting
+  clause, and FOR UPDATE OF <alias>.<column> rather than a bare FOR UPDATE because with the
+  two matrix tables joined in, a bare FOR UPDATE would try to lock the master rows too.
+-->
+<mapper namespace="id.co.bni.direct.transaction.repository.mapper.LimitMapper">
+
+    <!--
+      The matrix leg all four limit reads share. COM_ST_SRVC_CCY is where SRVC_CD lives;
+      COM_ST_SRVC_CCY_MTRX is where CCY_MTRX_CD lives. Both are needed on every read
+      precisely because neither table alone can answer "the LL ceiling for this service".
+      Neither carries a soft-delete flag, so there is nothing further to filter on here.
+    -->
+    <sql id="ccyMatrix">
+        JOIN COM_ST_SRVC_CCY_MTRX scm ON scm.ID = v.SRVC_CCY_MTRX_ID
+        JOIN COM_ST_SRVC_CCY scy      ON scy.ID = scm.SRVC_CCY_ID
+    </sql>
+
+    <!--
+      The company ceiling, locked. Selected columns are the whole LimitRow: the ID so the
+      increment addresses exactly the row that was locked, SRVC_CCY_MTRX_ID and CCY_MTRX_CD
+      so the caller can freeze onto the task what it validated against (V13), CCY_CD so it
+      knows what currency to convert the amount into, and both ceiling/usage pairs.
+
+      SRVC_CD is filtered on the matrix side (scy.SRVC_CD) rather than on v.SRVC_CD: the
+      matrix is the authoritative link between service and cell, and the denormalized copy
+      on the limit row is not guaranteed to agree with it.
+    -->
+    <select id="lockCorpLimit" resultType="id.co.bni.direct.transaction.entity.LimitRows$LimitRow">
+        SELECT v.ID               AS "id",
+               v.SRVC_CCY_MTRX_ID AS "srvcCcyMtrxId",
+               scm.CCY_MTRX_CD    AS "ccyMtrxCd",
+               v.CCY_CD           AS "ccyCd",
+               v.MAX_AMT_LMT      AS "maxAmtLmt",
+               v.AMT_LMT_USAGE    AS "amtLmtUsage",
+               v.MAX_OC_LMT       AS "maxOcLmt",
+               v.OC_LMT_USAGE     AS "ocLmtUsage"
+        FROM CORP_LMT_PC_DTL v
+        <include refid="ccyMatrix"/>
+        WHERE v.CORP_ID = #{companyId}
+          AND scy.SRVC_CD = #{srvcCd}
+          AND scm.CCY_MTRX_CD = #{ccyMtrxCd}
+          AND ROWNUM = 1
+        FOR UPDATE OF v.AMT_LMT_USAGE
+    </select>
+
+    <!--
+      The user-group ceiling, locked the same way. The two occurrence columns are selected
+      as typed NULLs because CORP_USR_GRP_LMT does not have them (see the header): CAST
+      rather than a bare NULL so Oracle reports a NUMBER and MyBatis maps it to the record's
+      Long instead of guessing from an untyped literal.
+    -->
+    <select id="lockGroupLimit" resultType="id.co.bni.direct.transaction.entity.LimitRows$LimitRow">
+        SELECT v.ID                 AS "id",
+               v.SRVC_CCY_MTRX_ID   AS "srvcCcyMtrxId",
+               scm.CCY_MTRX_CD      AS "ccyMtrxCd",
+               v.CCY_CD             AS "ccyCd",
+               v.MAX_AMT_LMT        AS "maxAmtLmt",
+               v.AMT_LMT_USAGE      AS "amtLmtUsage",
+               CAST(NULL AS NUMBER) AS "maxOcLmt",
+               CAST(NULL AS NUMBER) AS "ocLmtUsage"
+        FROM CORP_USR_GRP_LMT v
+        <include refid="ccyMatrix"/>
+        WHERE v.CORP_USR_GRP_ID = #{groupId}
+          AND scy.SRVC_CD = #{srvcCd}
+          AND scm.CCY_MTRX_CD = #{ccyMtrxCd}
+          AND ROWNUM = 1
+        FOR UPDATE OF v.AMT_LMT_USAGE
+    </select>
+
+    <!--
+      The limit-package template, the fallback for the two thirds of companies with no row
+      of their own. Entered from CORP because the package is not held on the limit row: the
+      company names a SERVICE package (CORP.SRVC_PC_CD), the service package names a LIMIT
+      package (COM_SRVC_PC.LIMIT_PACKAGE_FK, spelled unlike every other package FK on that
+      table), and the limit package is what COM_LMT_PC_DTL hangs off by LMT_PC_CD.
+
+      CORP.IS_DELETE = N'N' is checked here because CORP has the soft-delete flag the limit
+      tables lack - it is the only place in this chain where a dead company can be caught.
+      No FOR UPDATE and no lock: the package is a template nobody reserves against, and
+      locking it would serialize every company that shares it.
+    -->
+    <select id="findPackageLimit" resultType="id.co.bni.direct.transaction.entity.LimitRows$PackageLimitRow">
+        SELECT v.SRVC_CCY_MTRX_ID AS "srvcCcyMtrxId",
+               scm.CCY_MTRX_CD    AS "ccyMtrxCd",
+               v.CCY_CD           AS "ccyCd",
+               v.MAX_AMT_LMT      AS "maxAmtLmt",
+               v.MAX_OC_LMT       AS "maxOcLmt"
+        FROM CORP c
+        JOIN COM_SRVC_PC sp
+          ON sp.CD = c.SRVC_PC_CD
+        JOIN COM_LMT_PC_DTL v
+          ON v.LMT_PC_CD = sp.LIMIT_PACKAGE_FK
+        <include refid="ccyMatrix"/>
+        WHERE c.ID = #{companyId}
+          AND c.IS_DELETE = N'N'
+          AND scy.SRVC_CD = #{srvcCd}
+          AND scm.CCY_MTRX_CD = #{ccyMtrxCd}
+        FETCH FIRST 1 ROWS ONLY
+    </select>
+
+    <!--
+      Copy the package ceiling down into a per-company row - what the legacy procedure
+      INJECT_LIMIT_COMPANY does at company setup, done here because for 1,712 of 2,303
+      active companies it was never run. Without this row the company has nowhere to record
+      a reservation at all: COM_LMT_PC_DTL is a template shared by everyone on the package
+      and carries no usage columns, so writing usage there would charge every other company
+      on that package for this one's transaction.
+
+      Both usage columns start at 0 rather than NULL: this row is created at the moment of a
+      reservation that is about to be added to it, and a NULL would make the increment's
+      NVL(...) the only thing standing between the counter and a silent no-op. VERSION 0 is
+      the legacy convention for a freshly created row and CREATED_DT is SYSDATE so every
+      environment stamps database time.
+
+      LMT_PC_CD is deliberately left NULL. It is nullable on CORP_LMT_PC_DTL and it means
+      "the package this ceiling was born from" - useful provenance, but the caller passes
+      only the resolved figures, and inventing a package code here from a second lookup
+      would let this row claim a lineage the numbers may not actually have.
+    -->
+    <insert id="insertCorpLimitFromPackage">
+        INSERT INTO CORP_LMT_PC_DTL (ID, VERSION, CORP_ID, SRVC_CD, SRVC_CCY_MTRX_ID,
+                                     CCY_CD, MAX_AMT_LMT, MAX_OC_LMT,
+                                     AMT_LMT_USAGE, OC_LMT_USAGE,
+                                     CREATED_BY, CREATED_DT)
+        VALUES (#{id}, 0, #{companyId}, #{srvcCd}, #{srvcCcyMtrxId},
+                #{ccyCd}, #{maxAmtLmt}, #{maxOcLmt},
+                0, 0,
+                #{createdBy}, SYSDATE)
+    </insert>
+
+    <!--
+      Move the company row's two counters. Addressed by ID - the id carried out of
+      lockCorpLimit, never a re-resolution, because of the documented duplicates.
+
+      A NEGATIVE amount and count is HOW A RELEASE WORKS. Rejecting a task, or an execution
+      that fails, calls this with the negated amount and -1; there is no separate release
+      statement, on purpose, because a release using different arithmetic than the
+      reservation would drift from it. Nothing is floored at zero and nothing should be: a
+      release always matches an earlier reservation on this same row, so a GREATEST(...,0)
+      could only ever swallow the evidence of a double release or a release against the
+      wrong row. Usage that goes negative is a signal, not a state to be tidied away.
+
+      NVL on both sides because legacy rows created before this application exist with NULL
+      counters, and NULL + 1 is NULL - the increment would quietly do nothing.
+    -->
+    <update id="addCorpUsage">
+        UPDATE CORP_LMT_PC_DTL
+        SET AMT_LMT_USAGE = NVL(AMT_LMT_USAGE, 0) + #{amount},
+            OC_LMT_USAGE  = NVL(OC_LMT_USAGE, 0) + #{count}
+        WHERE ID = #{id}
+    </update>
+
+    <!--
+      The same for the group row, money only. #{count} is accepted by the mapper method so
+      both ladders can be driven with one call shape, and is intentionally not referenced
+      here: CORP_USR_GRP_LMT has no OC_LMT_USAGE column (see the header). Same negative-is-a-
+      release and same no-floor reasoning as addCorpUsage.
+    -->
+    <update id="addGroupUsage">
+        UPDATE CORP_USR_GRP_LMT
+        SET AMT_LMT_USAGE = NVL(AMT_LMT_USAGE, 0) + #{amount}
+        WHERE ID = #{id}
+    </update>
+
+</mapper>

@@ -42,7 +42,11 @@ public final class ActivityRows {
             String journalNo,
             String makerUserName,
             String orderPartyRefNo,
-            String counterPartyRefNo) {
+            String counterPartyRefNo,
+            /* Workflow position, TASK rows only - null on every legacy/VA row. */
+            Integer currentStageSeq,
+            Integer approvalStageCount,
+            String currentStageType) {
     }
 
     /**
@@ -56,7 +60,7 @@ public final class ActivityRows {
         private LocalDate dateFrom;
         private LocalDate dateTo;
         private String menuCd;
-        private String statusGroup;
+        private java.util.List<String> statusGroups;
         private String sourceAccountNo;
         private String beneficiaryName;
         private BigDecimal amountFrom;
@@ -75,8 +79,8 @@ public final class ActivityRows {
         public void setDateTo(LocalDate dateTo) { this.dateTo = dateTo; }
         public String getMenuCd() { return menuCd; }
         public void setMenuCd(String menuCd) { this.menuCd = menuCd; }
-        public String getStatusGroup() { return statusGroup; }
-        public void setStatusGroup(String statusGroup) { this.statusGroup = statusGroup; }
+        public java.util.List<String> getStatusGroups() { return statusGroups; }
+        public void setStatusGroups(java.util.List<String> statusGroups) { this.statusGroups = statusGroups; }
         public String getSourceAccountNo() { return sourceAccountNo; }
         public void setSourceAccountNo(String sourceAccountNo) { this.sourceAccountNo = sourceAccountNo; }
         public String getBeneficiaryName() { return beneficiaryName; }

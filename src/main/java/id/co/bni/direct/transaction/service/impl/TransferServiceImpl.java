@@ -15,6 +15,8 @@ import id.co.bni.direct.transaction.dto.response.TransferResponses.InquiryRespon
 import id.co.bni.direct.transaction.dto.response.TransferResponses.InterbankInquiryResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.MethodInfoResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.OtpChallengeResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.ChargeComponentResponse;
+import id.co.bni.direct.transaction.dto.response.TransferResponses.MoneyResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.StageResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.SubmitResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.TaskDetailResponse;
@@ -41,8 +43,12 @@ import id.co.bni.direct.transaction.integration.CoreTransferClient;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.StageActionResponse;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
+import id.co.bni.direct.transaction.entity.ChargeRows;
+import id.co.bni.direct.transaction.repository.mapper.ChargeMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
+import id.co.bni.direct.transaction.service.ChargeService;
 import id.co.bni.direct.transaction.service.ExecutionService;
+import id.co.bni.direct.transaction.service.LimitService;
 import id.co.bni.direct.transaction.service.TransferService;
 import id.co.bni.direct.transaction.service.AmountRules;
 import id.co.bni.direct.transaction.service.TransferType;
@@ -136,6 +142,9 @@ public class TransferServiceImpl implements TransferService {
 
     private final TransferMapper transferMapper;
     private final TrxTaskMapper trxTaskMapper;
+    private final ChargeMapper chargeMapper;
+    private final ChargeService chargeService;
+    private final LimitService limitService;
     private final AccountNameClient accountNameClient;
     private final CoreTransferClient coreTransferClient;
     private final UmasAuthenticatorClient authenticatorClient;
@@ -146,6 +155,9 @@ public class TransferServiceImpl implements TransferService {
 
     public TransferServiceImpl(TransferMapper transferMapper,
                                TrxTaskMapper trxTaskMapper,
+                               ChargeMapper chargeMapper,
+                               ChargeService chargeService,
+                               LimitService limitService,
                                AccountNameClient accountNameClient,
                                CoreTransferClient coreTransferClient,
                                UmasAuthenticatorClient authenticatorClient,
@@ -155,6 +167,9 @@ public class TransferServiceImpl implements TransferService {
                                PlatformTransactionManager transactionManager) {
         this.transferMapper = transferMapper;
         this.trxTaskMapper = trxTaskMapper;
+        this.chargeMapper = chargeMapper;
+        this.chargeService = chargeService;
+        this.limitService = limitService;
         this.accountNameClient = accountNameClient;
         this.coreTransferClient = coreTransferClient;
         this.authenticatorClient = authenticatorClient;
@@ -301,20 +316,52 @@ public class TransferServiceImpl implements TransferService {
             cross = resolveMultiCurrency(companyId, request, amount, currency);
         }
 
+        // c2. THE CHARGE, from the legacy tariff of THIS company - no longer the flat
+        // per-method constant. A transfer is priced as several components (an LLG
+        // transfer costs a Transfer Fee plus an LLG Fee), each with its own currency,
+        // and their IDR total is what FEE_AMT carries so every existing consumer of that
+        // column keeps working. A VA payment is the exception: its fee is quoted by the
+        // biller on the inquiry, not taken from the charge matrix.
+        ChargeService.ChargeBearer bearer = ChargeService.ChargeBearer.parse(request.chargeTo());
+        ChargeService.ChargeQuote charge;
+        if (type.isVirtualAccount()) {
+            // The biller priced this one on the inquiry the customer already saw; the
+            // charge matrix has no say. It is still expressed as a component so the
+            // ladder, the stored total and the screens all read one shape.
+            charge = vaCharge(domestic);
+        } else {
+            charge = chargeService.quote(companyId, srvcCd, currency);
+            domestic = withFee(domestic, charge.totalIdr());
+        }
+
         // The DEBIT side is what the limits guard (P5): for a cross transfer that is
         // the customer-typed debit amount in the SOURCE currency; everywhere else the
-        // credit amount (+ the flat domestic fee) in the wire currency - P0/P1 math
-        // unchanged.
+        // credit amount (+ the charge) in the wire currency - P0/P1 math unchanged.
         String ladderCcy = cross != null && cross.debitCcyCd() != null
                 ? cross.debitCcyCd() : currency;
         BigDecimal ladderAmt = cross != null && cross.debitAmt() != null
                 ? cross.debitAmt() : amount;
-        // P6: on a cross Bank Lain transfer the flat IDR fee is INSIDE the leg-1 credit
-        // the customer's debit amount pays for (see SimsemRefunder.leg1Credit), so the
-        // ladder sees the debit amount alone - an IDR fee cannot be added to a valas
-        // figure. Single-leg domestic math (amount + fee) is unchanged.
-        BigDecimal totalDebit = ladderAmt.add(domestic != null && cross == null
-                ? nvl(domestic.feeAmt()) : BigDecimal.ZERO);
+        // Three reasons the charge may not be added to the figure the ladder sees, and
+        // they are different reasons:
+        //   BENEFICIARY - the charge comes off the CREDIT side, so the source account is
+        //     debited the principal alone and that is what every ceiling must measure.
+        //   P6 two-leg   - the IDR charge is INSIDE the leg-1 credit the customer's valas
+        //     debit pays for (SimsemRefunder.leg1Credit), so adding it again would
+        //     double-count it, and an IDR figure cannot be added to a valas one anyway.
+        //   valas ladder - the charge total is IDR by construction; a ladder running in
+        //     another currency has nothing to add it to. Charges in that situation are
+        //     already inside the leg-1 credit above; anything else is refused at submit
+        //     rather than silently mixing currencies.
+        boolean chargeOnDebitSide = bearer == ChargeService.ChargeBearer.REMITTER && cross == null;
+        if (bearer == ChargeService.ChargeBearer.REMITTER && cross != null
+                && !ChargeServiceImpl.BASELINE_CCY.equals(ladderCcy)
+                && charge.totalIdr().signum() > 0 && !isTwoLegCandidate(type)) {
+            throw new BusinessRuleException("CHARGE_CURRENCY_MISMATCH",
+                    "Biaya dalam IDR tidak dapat dibebankan pada transaksi bermata uang "
+                            + ladderCcy + ".");
+        }
+        BigDecimal totalDebit = ladderAmt.add(chargeOnDebitSide
+                ? charge.totalIdr() : BigDecimal.ZERO);
 
         // d. The limit ladder - every rung only binds when its row exists, and every
         // rung sees the debited total.
@@ -325,19 +372,20 @@ public class TransferServiceImpl implements TransferService {
                     "Nominal transaksi berada di luar batas limit bank untuk layanan ini.");
         }
 
-        UsageLimitRow corpLimit = transferMapper.findCorpLimit(companyId, srvcCd, ladderCcy);
-        if (corpLimit != null && corpLimit.maxAmtLmt() != null
-                && nvl(corpLimit.amtLmtUsage()).add(totalDebit).compareTo(corpLimit.maxAmtLmt()) > 0) {
-            throw new BusinessRuleException("COMPANY_LIMIT",
-                    "Nominal transaksi melebihi sisa limit harian perusahaan.");
-        }
-
-        UsageLimitRow groupLimit = transferMapper.findGroupLimit(maker.groupId(), srvcCd, ladderCcy);
-        if (groupLimit != null && groupLimit.maxAmtLmt() != null
-                && nvl(groupLimit.amtLmtUsage()).add(totalDebit).compareTo(groupLimit.maxAmtLmt()) > 0) {
-            throw new BusinessRuleException("GROUP_LIMIT",
-                    "Nominal transaksi melebihi sisa limit grup pengguna.");
-        }
+        // The DAILY ceilings - company and user group - are checked AND CONSUMED here, not
+        // at release. Reading them without taking them let ten pending transfers each pass
+        // against the same untouched ceiling and only the tenth fail, after its whole
+        // approval chain had signed it off. The reservation is given back when the task is
+        // rejected or refused by core banking; an UNKNOWN execution keeps it, because the
+        // money may already have moved.
+        //
+        // The lookup is by CURRENCY COMBINATION (LL / FL / ...), which is why the source
+        // account's currency is passed in: a Forex-Local transfer's ceiling is usually
+        // denominated in IDR, and matching a row by the transaction's currency - what this
+        // code did before - found nothing and quietly stopped limiting anything.
+        LimitService.Reservation reservation = limitService.reserve(
+                companyId, maker.groupId(), srvcCd,
+                cross != null ? cross.debitCcyCd() : null, ladderCcy, totalDebit, actor);
 
         BigDecimal debitLimit = transferMapper.findAccountDebitLimit(companyId, request.sourceAccountNo());
         if (debitLimit != null && totalDebit.compareTo(debitLimit) > 0) {
@@ -466,7 +514,23 @@ public class TransferServiceImpl implements TransferService {
                 cross,
                 type.isVirtualAccount() ? trimTo(request.inquiryRequestId(), 64) : null,
                 bifast,
-                type.isVirtualAccount() ? VaBill.toJson(vaBill(request)) : null));
+                type.isVirtualAccount() ? VaBill.toJson(vaBill(request)) : null,
+                bearer.name(),
+                reservation.isEmpty() ? null : new TrxTaskRows.LimitReservationInsert(
+                        reservation.srvcCcyMtrxId(), reservation.ccyMtrxCd(),
+                        reservation.ccyCd(), reservation.amount())));
+
+        // The charge as it was priced, frozen component by component: the tariff amount
+        // in its own currency AND the IDR figure with the rate that produced it. Storing
+        // only the total would make "why this number" unanswerable the first time anyone
+        // asks, and the components are what the confirmation screen itemises.
+        for (ChargeService.ChargeComponent component : charge.components()) {
+            chargeMapper.insertCharge(new ChargeRows.ChargeInsert(
+                    newId(), taskId, component.seqNo(), component.chTypCd(),
+                    component.chTypNm(), component.ccyCd(), component.amt(),
+                    component.idrAmt(), component.fxRate(), component.fxRateType(),
+                    component.fxRateSide(), component.tariffSource(), actor));
+        }
 
         if (!singleUser) {
             int seq = 1;
@@ -611,6 +675,26 @@ public class TransferServiceImpl implements TransferService {
         BigDecimal fee = task.feeAmt();
         BigDecimal total = task.trxAmt() == null ? null
                 : task.trxAmt().add(fee != null ? fee : BigDecimal.ZERO);
+        // The itemised charge. An approver signing this off has to see what is actually
+        // charged and to whom - a single number cannot say that a transfer priced at two
+        // components is billed to the beneficiary.
+        List<ChargeRows.ChargeRow> chargeRows = chargeMapper.findCharges(taskId);
+        List<ChargeComponentResponse> fees = chargeRows.stream()
+                .map(c -> new ChargeComponentResponse(c.chTypCd(), c.chTypNm(),
+                        new MoneyResponse(c.amt(), c.ccyCd()),
+                        c.requotedIdrAmt() != null ? c.requotedIdrAmt() : c.idrAmt(),
+                        c.requotedFxRate() != null ? c.requotedFxRate() : c.fxRate(),
+                        c.fxRateType()))
+                .toList();
+        BigDecimal totalFee = fees.stream().map(ChargeComponentResponse::amountIdr)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        String chargeTo = task.chargeTo() == null
+                ? ChargeService.ChargeBearer.REMITTER.name() : task.chargeTo();
+        // What actually leaves the source account: on BENEFICIARY the charge is taken off
+        // the credit side, so the debit is the principal alone.
+        BigDecimal totalDebited = task.trxAmt() == null ? null
+                : ChargeService.ChargeBearer.BENEFICIARY.name().equals(chargeTo)
+                        ? task.trxAmt() : task.trxAmt().add(totalFee);
         return new TaskDetailResponse(task.id(), task.refNo(), menuName(task.menuCd(), task.srvcCd()),
                 task.status(), task.trxAmt(), task.trxCcyCd(), task.remAcctNo(),
                 task.benAcctNo(), task.benAcctNm(), task.remark1(), task.makerUserName(),
@@ -623,7 +707,12 @@ public class TransferServiceImpl implements TransferService {
                 task.advisoryMsg(), task.sourceProductType(),
                 task.twoLegState(), task.simsemAcctNo(), task.journalNoSimsem(),
                 task.trxId(), task.endToEndId(), task.bifastPurposeCd(),
-                vaTrxType(task.vaBillJson()));
+                vaTrxType(task.vaBillJson()),
+                chargeTo,
+                fees.isEmpty() ? null : fees,
+                fees.isEmpty() ? null : new MoneyResponse(totalFee, ChargeServiceImpl.BASELINE_CCY),
+                totalDebited == null ? null
+                        : new MoneyResponse(totalDebited, ChargeServiceImpl.BASELINE_CCY));
     }
 
     /** OPEN / FIXED from the frozen VA bill block; null for a task without one. */
@@ -949,6 +1038,48 @@ public class TransferServiceImpl implements TransferService {
     private static String onlineCd(DomBankRow bank) {
         String onlineCd = bank.onlineCd() == null ? null : bank.onlineCd().trim();
         return onlineCd == null || onlineCd.isEmpty() ? null : onlineCd;
+    }
+
+    /**
+     * The VA fee as a charge component, so the one code path downstream does not need to
+     * know where the number came from. Zero fees answer an empty quote rather than a
+     * component worth nothing.
+     */
+    private static ChargeService.ChargeQuote vaCharge(TrxTaskRows.DomesticInsert domestic) {
+        BigDecimal fee = domestic == null ? null : domestic.feeAmt();
+        if (fee == null || fee.signum() == 0) {
+            return ChargeService.ChargeQuote.none();
+        }
+        return new ChargeService.ChargeQuote(List.of(new ChargeService.ChargeComponent(
+                1, "VA", "Biaya admin", ChargeServiceImpl.BASELINE_CCY, fee, fee,
+                null, null, null, "BILLER")), fee);
+    }
+
+    /**
+     * The same domestic block with the quoted charge on it. In-house transfers reach this
+     * with no block at all and get one carrying nothing but the fee - every other column
+     * stays null, which is exactly what an in-house task wrote before the charge engine.
+     */
+    private static TrxTaskRows.DomesticInsert withFee(TrxTaskRows.DomesticInsert domestic,
+                                                      BigDecimal feeAmt) {
+        if (domestic == null) {
+            return new TrxTaskRows.DomesticInsert(null, null, null, null, null, null, null,
+                    null, null, null, null, null, null, null, feeAmt);
+        }
+        return new TrxTaskRows.DomesticInsert(domestic.benDomBnkId(), domestic.benBnkCd(),
+                domestic.benBnkNm(), domestic.benBnkBic(), domestic.benAddr1(),
+                domestic.benAddr2(), domestic.benAddr3(), domestic.benPhone(),
+                domestic.benPostalCd(), domestic.benIdType(), domestic.benIdNo(),
+                domestic.benType(), domestic.lldIsRemRes(), domestic.lldIsBenRes(), feeAmt);
+    }
+
+    /**
+     * Whether a cross transfer of this type routes through a simsem account, where the
+     * IDR charge rides inside leg 1 instead of being added to a valas ladder. Only
+     * kliring and RTGS do; the others refuse a valas source outright at resolve time.
+     */
+    private static boolean isTwoLegCandidate(TransferType type) {
+        return type == TransferType.LLG || type == TransferType.RTGS;
     }
 
     /** The per-method config constants (fee, TSA where the protocol has one). */

@@ -40,6 +40,13 @@ public interface TrxTaskMapper {
                                            @Param("stageSeq") Integer stageSeq,
                                            @Param("userId") String userId);
 
+    /**
+     * The names of candidates on one stage who have not acted on it yet - the "waiting
+     * on" list of the view-only workflow ladder. Ordered by name; the service truncates.
+     */
+    List<String> findPendingCandidateNames(@Param("taskId") String taskId,
+                                           @Param("stageSeq") Integer stageSeq);
+
     /** How many actions this actor (CORP_USR.ID) already wrote on one stage. */
     int countStageActions(@Param("taskId") String taskId,
                           @Param("stageSeq") Integer stageSeq,

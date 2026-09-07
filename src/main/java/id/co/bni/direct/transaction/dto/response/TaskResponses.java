@@ -68,4 +68,22 @@ public final class TaskResponses {
     public record ReconcileResponse(String taskId, String status, String twoLegState,
                                     String outcome, String message) {
     }
+
+    /**
+     * The answer of a batch action that went through in full - there is no partial
+     * success on this path, so {@code succeeded} equals {@code requested} except on a dry
+     * run, which writes nothing and reports 0.
+     *
+     * <p>{@code results} carries one line per task with the status it holds AFTER the
+     * action. Different values inside one batch are normal, not a bug: a task with two
+     * approval levels moves on to the next level while a single-level one goes straight
+     * to PENDING_RELEASE.
+     */
+    public record BulkActionResponse(int requested, int succeeded, boolean dryRun,
+                                     List<BulkResultResponse> results) {
+    }
+
+    /** One task of a batch and where it landed. */
+    public record BulkResultResponse(String taskId, String refNo, String status) {
+    }
 }

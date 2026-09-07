@@ -132,6 +132,12 @@ app:
     # Raw exception text in responses. Overridden to false in application-prod.yml.
     expose-detail: ${ERRORS_EXPOSE_DETAIL:false}
 
+  tasks:
+    # How many tasks one approve/release/reject batch may carry. A ceiling rather than a
+    # constant so it can be lowered from configuration if a batch of this size turns out
+    # to hold its transaction open longer than the database is comfortable with.
+    bulk-max-size: ${TASKS_BULK_MAX_SIZE:50}
+
   execution:
     # How a completed workflow gets executed. sync (default): in the releasing request,
     # the HTTP answer carries the verdict - no broker needed, dev behaves exactly as
@@ -154,6 +160,7 @@ app:
     group: ${EXECUTION_GROUP:direct-transaction-executor}
     # Parallel listener threads; the VERSION-guarded claim makes concurrency safe.
     concurrency: ${EXECUTION_CONCURRENCY:3}
+
 
   transfer:
     # P1 domestic-transfer constants. Fees are the flat placeholder until the P4 charge

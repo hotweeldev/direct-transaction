@@ -16,6 +16,7 @@ import id.co.bni.direct.transaction.exception.BusinessRuleException;
 import id.co.bni.direct.transaction.exception.NotFoundException;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient.Verification;
+import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
 import id.co.bni.direct.transaction.service.impl.ExecutionOutbox;
 import id.co.bni.direct.transaction.service.impl.TaskApprovalServiceImpl;
@@ -63,8 +64,9 @@ class TaskApprovalServiceImplTest {
         executionOutbox = mock(ExecutionOutbox.class);
         // A mocked manager makes the TransactionTemplate run its callback with no real
         // transaction - the commit-before-execute ordering is structural, not asserted.
-        service = new TaskApprovalServiceImpl(trxTaskMapper, authenticatorClient,
-                executionService, executionOutbox, mock(PlatformTransactionManager.class));
+        service = new TaskApprovalServiceImpl(trxTaskMapper, mock(TransferMapper.class),
+                mock(LimitService.class), authenticatorClient,
+                executionService, executionOutbox, mock(PlatformTransactionManager.class), 50);
     }
 
     private static TaskRow task(String status, Integer currentStageSeq, long version) {

@@ -40,7 +40,46 @@ public final class TrxTaskRows {
             CrossInsert cross,
             String vaInquiryReqId,
             BiFastInsert bifast,
-            String vaBillJson) {
+            String vaBillJson,
+            /** 'REMITTER' or 'BENEFICIARY'; null on tasks minted before the charge engine. */
+            String chargeTo,
+            /**
+             * What this task reserved of the daily ceilings, frozen so a release gives back
+             * exactly what was taken. Null on every task minted before the reservation
+             * existed, and on transfers no ceiling row applies to.
+             */
+            LimitReservationInsert limit) {
+
+        /** The pre-reservation shape (everything but the limit block). */
+        public TaskInsert(String id, String corpId, String menuCd, String srvcCd,
+                          String refNo, String status, Integer currentStageSeq,
+                          String remAcctNo, String benAcctNo, String benAcctNm,
+                          BigDecimal trxAmt, String trxCcyCd, String remark1,
+                          String remark2, String remark3, String instructionMode,
+                          String makerUserId, String makerUserName, String isSingleUser,
+                          String createdBy, DomesticInsert domestic, CrossInsert cross,
+                          String vaInquiryReqId, BiFastInsert bifast, String vaBillJson,
+                          String chargeTo) {
+            this(id, corpId, menuCd, srvcCd, refNo, status, currentStageSeq, remAcctNo,
+                    benAcctNo, benAcctNm, trxAmt, trxCcyCd, remark1, remark2, remark3,
+                    instructionMode, makerUserId, makerUserName, isSingleUser, createdBy,
+                    domestic, cross, vaInquiryReqId, bifast, vaBillJson, chargeTo, null);
+        }
+
+        /** The pre-charge-engine shape (everything but the charge bearer). */
+        public TaskInsert(String id, String corpId, String menuCd, String srvcCd,
+                          String refNo, String status, Integer currentStageSeq,
+                          String remAcctNo, String benAcctNo, String benAcctNm,
+                          BigDecimal trxAmt, String trxCcyCd, String remark1,
+                          String remark2, String remark3, String instructionMode,
+                          String makerUserId, String makerUserName, String isSingleUser,
+                          String createdBy, DomesticInsert domestic, CrossInsert cross,
+                          String vaInquiryReqId, BiFastInsert bifast, String vaBillJson) {
+            this(id, corpId, menuCd, srvcCd, refNo, status, currentStageSeq, remAcctNo,
+                    benAcctNo, benAcctNm, trxAmt, trxCcyCd, remark1, remark2, remark3,
+                    instructionMode, makerUserId, makerUserName, isSingleUser, createdBy,
+                    domestic, cross, vaInquiryReqId, bifast, vaBillJson, null, null);
+        }
 
         /** The pre-V11 shape (everything but the frozen VA bill block). */
         public TaskInsert(String id, String corpId, String menuCd, String srvcCd,
@@ -54,7 +93,7 @@ public final class TrxTaskRows {
             this(id, corpId, menuCd, srvcCd, refNo, status, currentStageSeq, remAcctNo,
                     benAcctNo, benAcctNm, trxAmt, trxCcyCd, remark1, remark2, remark3,
                     instructionMode, makerUserId, makerUserName, isSingleUser, createdBy,
-                    domestic, cross, vaInquiryReqId, bifast, null);
+                    domestic, cross, vaInquiryReqId, bifast, null, null);
         }
 
         /** The pre-P7 shape (everything but the V10 BI-Fast block). */
@@ -138,6 +177,20 @@ public final class TrxTaskRows {
             String lldIsRemRes,
             String lldIsBenRes,
             BigDecimal feeAmt) {
+    }
+
+    /**
+     * The V13 limit block: which daily ceiling line this task consumed, in which currency
+     * combination, and how much of it - in the CEILING's currency, which is not necessarily
+     * the transfer's. Frozen at submit because the combination is derived from the source
+     * account's currency, and an administrator can change that under a task that is still
+     * waiting for its approvals.
+     */
+    public record LimitReservationInsert(
+            String srvcCcyMtrxId,
+            String ccyMtrxCd,
+            String ccyCd,
+            BigDecimal reservedAmt) {
     }
 
     /**
@@ -263,7 +316,60 @@ public final class TrxTaskRows {
             String trxId,
             String endToEndId,
             String bifastPurposeCd,
-            String vaBillJson) {
+            String vaBillJson,
+            /** 'REMITTER' or 'BENEFICIARY'; null on tasks minted before the charge engine. */
+            String chargeTo,
+            String lmtSrvcCcyMtrxId,
+            String lmtCcyMtrxCd,
+            String lmtCcyCd,
+            BigDecimal lmtReservedAmt,
+            /** CORP_USR.ID of the maker - the group whose ceiling the reservation used. */
+            String makerUserId) {
+
+        /** The pre-reservation shape (everything but the limit block). */
+        public TaskRow(String id, String refNo, String menuCd, String srvcCd,
+                       String status, Integer currentStageSeq, BigDecimal trxAmt,
+                       String trxCcyCd, String remAcctNo, String benAcctNo,
+                       String benAcctNm, String remark1, String makerUserName,
+                       LocalDateTime createdDt, Long version, String coreJournal,
+                       String trxRefNo, LocalDateTime executedDt, String benDomBnkId,
+                       String benBnkNm, String benBnkCd, String benBnkBic,
+                       BigDecimal feeAmt, String retrievalRefNo, String interbankResponseCd,
+                       String debitCcyCd, BigDecimal debitAmt, BigDecimal exchangeRate,
+                       String sourceProductType, String advisoryMsg, String twoLegState,
+                       String simsemAcctNo, String journalNoSimsem, String trxId,
+                       String endToEndId, String bifastPurposeCd, String vaBillJson,
+                       String chargeTo) {
+            this(id, refNo, menuCd, srvcCd, status, currentStageSeq, trxAmt, trxCcyCd,
+                    remAcctNo, benAcctNo, benAcctNm, remark1, makerUserName, createdDt,
+                    version, coreJournal, trxRefNo, executedDt, benDomBnkId, benBnkNm,
+                    benBnkCd, benBnkBic, feeAmt, retrievalRefNo, interbankResponseCd,
+                    debitCcyCd, debitAmt, exchangeRate, sourceProductType, advisoryMsg,
+                    twoLegState, simsemAcctNo, journalNoSimsem, trxId, endToEndId,
+                    bifastPurposeCd, vaBillJson, chargeTo, null, null, null, null, null);
+        }
+
+        /** The pre-charge-engine shape (everything but the charge bearer). */
+        public TaskRow(String id, String refNo, String menuCd, String srvcCd,
+                       String status, Integer currentStageSeq, BigDecimal trxAmt,
+                       String trxCcyCd, String remAcctNo, String benAcctNo,
+                       String benAcctNm, String remark1, String makerUserName,
+                       LocalDateTime createdDt, Long version, String coreJournal,
+                       String trxRefNo, LocalDateTime executedDt, String benDomBnkId,
+                       String benBnkNm, String benBnkCd, String benBnkBic,
+                       BigDecimal feeAmt, String retrievalRefNo, String interbankResponseCd,
+                       String debitCcyCd, BigDecimal debitAmt, BigDecimal exchangeRate,
+                       String sourceProductType, String advisoryMsg, String twoLegState,
+                       String simsemAcctNo, String journalNoSimsem, String trxId,
+                       String endToEndId, String bifastPurposeCd, String vaBillJson) {
+            this(id, refNo, menuCd, srvcCd, status, currentStageSeq, trxAmt, trxCcyCd,
+                    remAcctNo, benAcctNo, benAcctNm, remark1, makerUserName, createdDt,
+                    version, coreJournal, trxRefNo, executedDt, benDomBnkId, benBnkNm,
+                    benBnkCd, benBnkBic, feeAmt, retrievalRefNo, interbankResponseCd,
+                    debitCcyCd, debitAmt, exchangeRate, sourceProductType, advisoryMsg,
+                    twoLegState, simsemAcctNo, journalNoSimsem, trxId, endToEndId,
+                    bifastPurposeCd, vaBillJson, null, null, null, null, null, null);
+        }
 
         /** The pre-V11 shape (everything but the frozen VA bill block). */
         public TaskRow(String id, String refNo, String menuCd, String srvcCd,
@@ -383,7 +489,68 @@ public final class TrxTaskRows {
             String bifastSettlementDt,
             String proxyType,
             String proxyId,
-            String vaBillJson) {
+            String vaBillJson,
+            /** 'REMITTER' or 'BENEFICIARY'; null on tasks minted before the charge engine. */
+            String chargeTo,
+            String lmtSrvcCcyMtrxId,
+            String lmtCcyMtrxCd,
+            String lmtCcyCd,
+            BigDecimal lmtReservedAmt) {
+
+        /** The pre-reservation shape (everything but the limit block). */
+        public ExecutionTaskRow(String id, String corpId, String menuCd, String srvcCd,
+                                String refNo, String status, String remAcctNo,
+                                String benAcctNo, String benAcctNm, BigDecimal trxAmt,
+                                String trxCcyCd, String remark1, String makerUserId,
+                                Long version, String benDomBnkId, String benBnkCd,
+                                String benBnkBic, String benAddr1, String benAddr2,
+                                String benAddr3, String benPhone, String benPostalCd,
+                                String benIdType, String benIdNo, String benType,
+                                String lldIsRemRes, String lldIsBenRes, BigDecimal feeAmt,
+                                String debitCcyCd, BigDecimal debitAmt, BigDecimal baseAmt,
+                                String rateType, String sourceProductType, String vaInquiryReqId,
+                                String bifastPurposeCd, String bifastCredId, String bifastCredType,
+                                String bifastCredAcctType, String bifastCredRsdntSts,
+                                String bifastCredTown, String bifastSettlementDt,
+                                String proxyType, String proxyId, String vaBillJson,
+                                String chargeTo) {
+            this(id, corpId, menuCd, srvcCd, refNo, status, remAcctNo, benAcctNo,
+                    benAcctNm, trxAmt, trxCcyCd, remark1, makerUserId, version,
+                    benDomBnkId, benBnkCd, benBnkBic, benAddr1, benAddr2, benAddr3,
+                    benPhone, benPostalCd, benIdType, benIdNo, benType, lldIsRemRes,
+                    lldIsBenRes, feeAmt, debitCcyCd, debitAmt, baseAmt, rateType,
+                    sourceProductType, vaInquiryReqId,
+                    bifastPurposeCd, bifastCredId, bifastCredType, bifastCredAcctType,
+                    bifastCredRsdntSts, bifastCredTown, bifastSettlementDt, proxyType, proxyId,
+                    vaBillJson, chargeTo, null, null, null, null);
+        }
+
+        /** The pre-charge-engine shape (everything but the charge bearer). */
+        public ExecutionTaskRow(String id, String corpId, String menuCd, String srvcCd,
+                                String refNo, String status, String remAcctNo,
+                                String benAcctNo, String benAcctNm, BigDecimal trxAmt,
+                                String trxCcyCd, String remark1, String makerUserId,
+                                Long version, String benDomBnkId, String benBnkCd,
+                                String benBnkBic, String benAddr1, String benAddr2,
+                                String benAddr3, String benPhone, String benPostalCd,
+                                String benIdType, String benIdNo, String benType,
+                                String lldIsRemRes, String lldIsBenRes, BigDecimal feeAmt,
+                                String debitCcyCd, BigDecimal debitAmt, BigDecimal baseAmt,
+                                String rateType, String sourceProductType, String vaInquiryReqId,
+                                String bifastPurposeCd, String bifastCredId, String bifastCredType,
+                                String bifastCredAcctType, String bifastCredRsdntSts,
+                                String bifastCredTown, String bifastSettlementDt,
+                                String proxyType, String proxyId, String vaBillJson) {
+            this(id, corpId, menuCd, srvcCd, refNo, status, remAcctNo, benAcctNo,
+                    benAcctNm, trxAmt, trxCcyCd, remark1, makerUserId, version,
+                    benDomBnkId, benBnkCd, benBnkBic, benAddr1, benAddr2, benAddr3,
+                    benPhone, benPostalCd, benIdType, benIdNo, benType, lldIsRemRes,
+                    lldIsBenRes, feeAmt, debitCcyCd, debitAmt, baseAmt, rateType,
+                    sourceProductType, vaInquiryReqId,
+                    bifastPurposeCd, bifastCredId, bifastCredType, bifastCredAcctType,
+                    bifastCredRsdntSts, bifastCredTown, bifastSettlementDt, proxyType, proxyId,
+                    vaBillJson, null, null, null, null, null);
+        }
 
         /** The pre-V11 shape (everything but the frozen VA bill block). */
         public ExecutionTaskRow(String id, String corpId, String menuCd, String srvcCd,
@@ -409,7 +576,7 @@ public final class TrxTaskRows {
                     sourceProductType, vaInquiryReqId,
                     bifastPurposeCd, bifastCredId, bifastCredType, bifastCredAcctType,
                     bifastCredRsdntSts, bifastCredTown, bifastSettlementDt, proxyType, proxyId,
-                    null);
+                    null, null);
         }
 
         /** The pre-P7 shape (everything but the V10 BI-Fast block). */

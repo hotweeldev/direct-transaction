@@ -1,6 +1,7 @@
 package id.co.bni.direct.transaction.config;
 
 import id.co.bni.direct.transaction.dto.response.CommonResponses.ErrorMessageResponse;
+import id.co.bni.direct.transaction.exception.BulkAbortedException;
 import id.co.bni.direct.transaction.exception.BusinessRuleException;
 import id.co.bni.direct.transaction.exception.ForbiddenException;
 import id.co.bni.direct.transaction.exception.NotFoundException;
@@ -63,6 +64,22 @@ public class GlobalExceptionHandler {
      * business state refused it, and the FE switches on {@code errorCode} to decide which
      * screen state to show. The message is Indonesian and renderable as-is.
      */
+    /**
+     * A batch refused as a whole. Same 422 and same body shape as a single business-rule
+     * refusal, plus the per-task list: the screen has to be able to point at the rows that
+     * blocked the batch, and one message cannot do that for twenty selections.
+     */
+    @ExceptionHandler(BulkAbortedException.class)
+    public ResponseEntity<BulkErrorResponse> handleBulkAborted(BulkAbortedException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new BulkErrorResponse(ex.getMessage(), "BULK_ABORTED", ex.failures()));
+    }
+
+    /** The batch error body: the usual pair, plus what failed. */
+    public record BulkErrorResponse(String message, String errorCode,
+                                    java.util.List<BulkAbortedException.Failure> failures) {
+    }
+
     @ExceptionHandler(BusinessRuleException.class)
     public ResponseEntity<ErrorMessageResponse> handleBusinessRule(BusinessRuleException ex) {
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)

@@ -1,8 +1,10 @@
 package id.co.bni.direct.transaction.controller;
 
 import id.co.bni.direct.transaction.dto.request.TaskRequests.ApproveTaskRequest;
+import id.co.bni.direct.transaction.dto.request.TaskRequests.BulkActionRequest;
 import id.co.bni.direct.transaction.dto.request.TaskRequests.ReconcileTaskRequest;
 import id.co.bni.direct.transaction.dto.request.TaskRequests.RejectTaskRequest;
+import id.co.bni.direct.transaction.dto.response.TaskResponses.BulkActionResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.InboxResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.ReconcileResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.TaskActionResponse;
@@ -107,6 +109,51 @@ public class TaskController {
             HttpServletRequest servletRequest) {
         TokenIdentity.requireSameUser(servletRequest, request.userId());
         return ResponseEntity.ok(reconciliationService.reconcile(companyId, taskId, actor));
+    }
+
+    /**
+     * Approve every task in the body at once, under one token verification.
+     *
+     * <p>Three endpoints rather than one because a batch must be homogeneous. The
+     * single-task {@code /approve} acts on whichever stage is active - approving or
+     * releasing depending on what it finds - and that "depends what it finds" behaviour is
+     * unsafe over a list: a user who ticked twenty rows cannot be left guessing which ones
+     * were approved and which were released. Here a task sitting on the other kind of
+     * stage is refused by name (STAGE_MISMATCH) and the whole batch stops.
+     *
+     * <p>Same guard stack as the single-task endpoints, and the same 422 vocabulary; a
+     * refused batch adds {@code failures}, one entry per offending task.
+     */
+    @PostMapping("/bulk-approve")
+    public ResponseEntity<BulkActionResponse> bulkApprove(
+            @PathVariable String companyId,
+            @Valid @RequestBody BulkActionRequest request,
+            @RequestHeader(value = "X-User-Id", defaultValue = "system") String actor,
+            HttpServletRequest servletRequest) {
+        TokenIdentity.requireSameUser(servletRequest, request.userId());
+        return ResponseEntity.ok(taskApprovalService.bulkApprove(companyId, actor, request));
+    }
+
+    /** Release every task in the body at once; tasks not awaiting release are refused. */
+    @PostMapping("/bulk-release")
+    public ResponseEntity<BulkActionResponse> bulkRelease(
+            @PathVariable String companyId,
+            @Valid @RequestBody BulkActionRequest request,
+            @RequestHeader(value = "X-User-Id", defaultValue = "system") String actor,
+            HttpServletRequest servletRequest) {
+        TokenIdentity.requireSameUser(servletRequest, request.userId());
+        return ResponseEntity.ok(taskApprovalService.bulkRelease(companyId, actor, request));
+    }
+
+    /** Reject every task in the body at once; one note, required, applies to all of them. */
+    @PostMapping("/bulk-reject")
+    public ResponseEntity<BulkActionResponse> bulkReject(
+            @PathVariable String companyId,
+            @Valid @RequestBody BulkActionRequest request,
+            @RequestHeader(value = "X-User-Id", defaultValue = "system") String actor,
+            HttpServletRequest servletRequest) {
+        TokenIdentity.requireSameUser(servletRequest, request.userId());
+        return ResponseEntity.ok(taskApprovalService.bulkReject(companyId, actor, request));
     }
 
     /** Reject the task outright; the note saying why is required. */

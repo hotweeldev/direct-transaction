@@ -30,7 +30,9 @@
                               UND_DOC_NM, UND_DOC_AMT, UND_DOC_EXPIRY, VA_INQUIRY_REQ_ID,
                               BIFAST_PURPOSE_CD, BIFAST_CRED_ID, BIFAST_CRED_TYPE,
                               BIFAST_CRED_ACCT_TYPE, BIFAST_CRED_RSDNT_STS, BIFAST_CRED_TOWN,
-                              BIFAST_SETTLEMENT_DT, PROXY_TYPE, PROXY_ID, VA_BILL_JSON)
+                              BIFAST_SETTLEMENT_DT, PROXY_TYPE, PROXY_ID, VA_BILL_JSON,
+                              CHARGE_TO,
+                              LMT_SRVC_CCY_MTRX_ID, LMT_CCY_MTRX_CD, LMT_CCY_CD, LMT_RESERVED_AMT)
         VALUES (#{id}, #{corpId}, #{menuCd}, #{srvcCd}, #{refNo}, #{status},
                 #{currentStageSeq}, #{remAcctNo}, #{benAcctNo}, #{benAcctNm},
                 #{trxAmt}, #{trxCcyCd}, #{remark1}, #{remark2}, #{remark3},
@@ -45,7 +47,9 @@
                 #{cross.undDocNm}, #{cross.undDocAmt}, #{cross.undDocExpiry}, #{vaInquiryReqId},
                 #{bifast.purposeCd}, #{bifast.credId}, #{bifast.credType},
                 #{bifast.credAcctType}, #{bifast.credRsdntSts}, #{bifast.credTown},
-                #{bifast.settlementDt}, #{bifast.proxyType}, #{bifast.proxyId}, #{vaBillJson})
+                #{bifast.settlementDt}, #{bifast.proxyType}, #{bifast.proxyId}, #{vaBillJson},
+                #{chargeTo},
+                #{limit.srvcCcyMtrxId}, #{limit.ccyMtrxCd}, #{limit.ccyCd}, #{limit.reservedAmt})
     </insert>
 
     <insert id="insertStage">
@@ -97,6 +101,12 @@
                BEN_BNK_CD        AS "benBnkCd",
                BEN_BNK_BIC       AS "benBnkBic",
                FEE_AMT           AS "feeAmt",
+               CHARGE_TO         AS "chargeTo",
+               LMT_SRVC_CCY_MTRX_ID AS "lmtSrvcCcyMtrxId",
+               LMT_CCY_MTRX_CD      AS "lmtCcyMtrxCd",
+               LMT_CCY_CD           AS "lmtCcyCd",
+               LMT_RESERVED_AMT     AS "lmtReservedAmt",
+               MAKER_USER_ID        AS "makerUserId",
                RETRIEVAL_REF_NO  AS "retrievalRefNo",
                INTERBANK_RESPONSE_CD AS "interbankResponseCd",
                DEBIT_CCY_CD      AS "debitCcyCd",
@@ -148,6 +158,23 @@
         WHERE TRX_TASK_ID = #{taskId}
           AND STAGE_SEQ = #{stageSeq}
           AND USER_ID = #{userId}
+    </select>
+
+    <!-- Who a stage is still waiting on: candidates frozen for that stage who have not
+         written an action row on it yet. Feeds the view-only workflow ladder in Aktivitas
+         Transaksi, which answers "sedang menunggu siapa". Ordered by name so the truncated
+         list the service sends is stable between calls. -->
+    <select id="findPendingCandidateNames" resultType="string">
+        SELECT NVL(c.USER_NAME, c.USER_ID)
+        FROM TRX_TASK_CANDIDATE c
+        WHERE c.TRX_TASK_ID = #{taskId}
+          AND c.STAGE_SEQ = #{stageSeq}
+          AND NOT EXISTS (SELECT 1
+                          FROM TRX_TASK_ACTION a
+                          WHERE a.TRX_TASK_ID = c.TRX_TASK_ID
+                            AND a.STAGE_SEQ = c.STAGE_SEQ
+                            AND a.ACTOR_USER_ID = c.CORP_USR_ID)
+        ORDER BY NVL(c.USER_NAME, c.USER_ID)
     </select>
 
     <select id="countStageActions" resultType="int">
@@ -268,6 +295,11 @@
                LLD_IS_REM_RES AS "lldIsRemRes",
                LLD_IS_BEN_RES AS "lldIsBenRes",
                FEE_AMT        AS "feeAmt",
+               CHARGE_TO      AS "chargeTo",
+               LMT_SRVC_CCY_MTRX_ID AS "lmtSrvcCcyMtrxId",
+               LMT_CCY_MTRX_CD      AS "lmtCcyMtrxCd",
+               LMT_CCY_CD           AS "lmtCcyCd",
+               LMT_RESERVED_AMT     AS "lmtReservedAmt",
                DEBIT_CCY_CD   AS "debitCcyCd",
                DEBIT_AMT      AS "debitAmt",
                BASE_AMT       AS "baseAmt",

@@ -43,9 +43,11 @@
                t.SRVC_CD                     AS SRVC_CD,
                t.STATUS                      AS RAW_STATUS,
                CASE t.STATUS
-                    WHEN N'EXECUTED' THEN N'BERHASIL'
-                    WHEN N'FAILED'   THEN N'GAGAL'
-                    WHEN N'REJECTED' THEN N'GAGAL'
+                    WHEN N'PENDING_APPROVAL' THEN N'PENDING_APPROVAL'
+                    WHEN N'PENDING_RELEASE'  THEN N'PENDING_RELEASE'
+                    WHEN N'EXECUTED'         THEN N'BERHASIL'
+                    WHEN N'REJECTED'         THEN N'DITOLAK'
+                    WHEN N'FAILED'           THEN N'GAGAL'
                     ELSE N'DIPROSES'
                END                           AS STATUS_GROUP,
                t.TRX_AMT                     AS TRX_AMT,
@@ -61,7 +63,14 @@
                t.CORE_JOURNAL                AS JOURNAL_NO,
                t.MAKER_USER_NAME             AS MAKER_USER_NAME,
                CAST(NULL AS NVARCHAR2(40))   AS ORDER_PARTY_REF_NO,
-               CAST(NULL AS NVARCHAR2(40))   AS COUNTER_PARTY_REF_NO
+               CAST(NULL AS NVARCHAR2(40))   AS COUNTER_PARTY_REF_NO,
+               t.CURRENT_STAGE_SEQ           AS CURRENT_STAGE_SEQ,
+               (SELECT COUNT(*) FROM TRX_TASK_STAGE ts
+                 WHERE ts.TRX_TASK_ID = t.ID AND ts.STAGE_TYPE = N'APPROVAL')
+                                             AS APPROVAL_STAGE_COUNT,
+               (SELECT ts2.STAGE_TYPE FROM TRX_TASK_STAGE ts2
+                 WHERE ts2.TRX_TASK_ID = t.ID AND ts2.SEQ_NO = t.CURRENT_STAGE_SEQ)
+                                             AS CURRENT_STAGE_TYPE
         FROM TRX_TASK t
         WHERE t.CORP_ID = #{f.companyId}
         UNION ALL
@@ -86,7 +95,10 @@
                TO_NCHAR(f.JOURNAL_NO),
                mk.USER_ID,
                f.ORDER_PARTY_REF_NO,
-               f.COUNTER_PARTY_REF_NO
+               f.COUNTER_PARTY_REF_NO,
+               CAST(NULL AS NUMBER(5)),
+               CAST(NULL AS NUMBER(5)),
+               CAST(NULL AS NVARCHAR2(20))
         FROM BASE_FT f
         LEFT JOIN CORP_USR mk ON mk.ID = f.CREATED_BY
         WHERE f.REM_ACCT_NO IN (SELECT ca2.ACCT_NO FROM CORP_ACCT ca2 WHERE ca2.CORP_ID = #{f.companyId})
@@ -117,7 +129,10 @@
                CAST(NULL AS NVARCHAR2(40)),
                vmk.USER_ID,
                CAST(NULL AS NVARCHAR2(40)),
-               CAST(NULL AS NVARCHAR2(40))
+               CAST(NULL AS NVARCHAR2(40)),
+               CAST(NULL AS NUMBER(5)),
+               CAST(NULL AS NUMBER(5)),
+               CAST(NULL AS NVARCHAR2(20))
         FROM VIRTUAL_ACCOUNT_FT v
         LEFT JOIN CORP_USR vmk ON vmk.ID = v.CREATED_BY
         WHERE v.CORP_ID = #{f.companyId}
@@ -135,8 +150,15 @@
         <if test="f.menuCd != null">
             AND r.MENU_CD = #{f.menuCd}
         </if>
-        <if test="f.statusGroup != null">
-            AND r.STATUS_GROUP = #{f.statusGroup}
+        <!-- One chip on the screen can mean more than one STATUS_GROUP: the pre-stage
+             release of this change let an old FE send status=DIPROSES meaning "anything
+             still moving", and the service expands that to the three codes it used to
+             cover. Hence a list, not an equality. -->
+        <if test="f.statusGroups != null and f.statusGroups.size() > 0">
+            AND r.STATUS_GROUP IN
+            <foreach item="sg" collection="f.statusGroups" open="(" separator="," close=")">
+                #{sg}
+            </foreach>
         </if>
         <if test="f.sourceAccountNo != null">
             AND r.REM_ACCT_NO = #{f.sourceAccountNo}
@@ -180,7 +202,10 @@
                r.JOURNAL_NO           AS "journalNo",
                r.MAKER_USER_NAME      AS "makerUserName",
                r.ORDER_PARTY_REF_NO   AS "orderPartyRefNo",
-               r.COUNTER_PARTY_REF_NO AS "counterPartyRefNo"
+               r.COUNTER_PARTY_REF_NO AS "counterPartyRefNo",
+               r.CURRENT_STAGE_SEQ    AS "currentStageSeq",
+               r.APPROVAL_STAGE_COUNT AS "approvalStageCount",
+               r.CURRENT_STAGE_TYPE   AS "currentStageType"
         FROM (<include refid="activityUnion"/>) r
         LEFT JOIN ACCT a        ON a.ACCT_NO = r.REM_ACCT_NO
         LEFT JOIN COM_ST_SRVC s ON s.CD = r.SRVC_CD

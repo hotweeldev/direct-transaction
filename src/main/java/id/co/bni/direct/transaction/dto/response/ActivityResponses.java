@@ -29,7 +29,13 @@ public final class ActivityResponses {
             String rawStatus,
             String senderRefNo,
             String beneficiaryRefNo,
-            String fileRefNo) {
+            String fileRefNo,
+            /**
+             * Where a still-moving transaction stands, e.g. {@code "Approval 1 dari 2"}
+             * or {@code "Rilis"}. Null for anything that is not waiting on a stage -
+             * every legacy/VA row, and every task past PENDING_RELEASE.
+             */
+            String stageProgress) {
     }
 
     /** GET /transactions/recent. */
@@ -79,6 +85,24 @@ public final class ActivityResponses {
             LocalDateTime executedAt,
             String senderRefNo,
             String beneficiaryRefNo,
-            List<ActivityTrailResponse> activities) {
+            List<ActivityTrailResponse> activities,
+            /**
+             * The approval ladder, view-only. Filled ONLY while the transaction is still
+             * moving through it (PENDING_APPROVAL / PENDING_RELEASE); null for every
+             * other status and for legacy/VA rows, which have no ladder at all.
+             */
+            WorkflowResponse workflow) {
+    }
+
+    /**
+     * The view-only workflow ladder of one task: every stage in order, including the ones
+     * not reached yet - a stage that has not started is exactly what answers "berapa
+     * tahap lagi". Same element shape as the approval screen's {@code stages} so the FE
+     * renders it with the same component, actions disabled.
+     */
+    public record WorkflowResponse(
+            Integer currentStageSeq,
+            int totalApprovalStages,
+            List<TransferResponses.StageResponse> stages) {
     }
 }

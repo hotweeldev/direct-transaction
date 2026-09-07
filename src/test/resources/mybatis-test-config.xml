@@ -34,5 +34,7 @@
         <mapper resource="mapper/SimsemMapper.xml"/>
         <mapper resource="mapper/ExecutionOutboxMapper.xml"/>
         <mapper resource="mapper/ActivityMapper.xml"/>
+        <mapper resource="mapper/ChargeMapper.xml"/>
+        <mapper resource="mapper/LimitMapper.xml"/>
     </mappers>
 </configuration>

@@ -15,7 +15,11 @@ import id.co.bni.direct.transaction.integration.CoreTransferClient.BiFastOutcome
 import id.co.bni.direct.transaction.integration.CoreTransferClient.InterbankOutcome;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.TransferOutcome;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
+import id.co.bni.direct.transaction.entity.ChargeRows;
+import id.co.bni.direct.transaction.repository.mapper.ChargeMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
+import id.co.bni.direct.transaction.service.ChargeService;
+import id.co.bni.direct.transaction.service.LimitService;
 import id.co.bni.direct.transaction.service.ExecutionService;
 import id.co.bni.direct.transaction.service.SimsemPool;
 import id.co.bni.direct.transaction.service.TransferType;
@@ -29,6 +33,8 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.util.List;
+import java.math.RoundingMode;
 import java.util.UUID;
 
 /**
@@ -85,12 +91,18 @@ import java.util.UUID;
 @Primary
 public class CoreExecutionServiceImpl implements ExecutionService {
 
+    /** Percentage arithmetic for the release-time re-quote tolerance. */
+    private static final BigDecimal HUNDRED = new BigDecimal("100");
+
     private static final Logger log = LoggerFactory.getLogger(CoreExecutionServiceImpl.class);
 
     /** TRX_TASK_ACTION.NOTE is NVARCHAR2(400). */
     private static final int NOTE_MAX = 400;
 
     private final TrxTaskMapper trxTaskMapper;
+    private final ChargeMapper chargeMapper;
+    private final ChargeService chargeService;
+    private final LimitService limitService;
     private final TransferMapper transferMapper;
     private final CoreTransferClient coreTransferClient;
     private final TransferTypeProperties transferTypeProperties;
@@ -99,6 +111,9 @@ public class CoreExecutionServiceImpl implements ExecutionService {
     private final TransactionTemplate ownTransaction;
 
     public CoreExecutionServiceImpl(TrxTaskMapper trxTaskMapper,
+                                    ChargeMapper chargeMapper,
+                                    ChargeService chargeService,
+                                    LimitService limitService,
                                     TransferMapper transferMapper,
                                     CoreTransferClient coreTransferClient,
                                     TransferTypeProperties transferTypeProperties,
@@ -106,6 +121,9 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                                     SimsemRefunder simsemRefunder,
                                     PlatformTransactionManager transactionManager) {
         this.trxTaskMapper = trxTaskMapper;
+        this.chargeMapper = chargeMapper;
+        this.chargeService = chargeService;
+        this.limitService = limitService;
         this.transferMapper = transferMapper;
         this.coreTransferClient = coreTransferClient;
         this.transferTypeProperties = transferTypeProperties;
@@ -212,7 +230,18 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         // P6: on a two-leg task the flat IDR fee is INSIDE the leg-1 credit the frozen
         // valas debit amount pays for (SimsemRefunder.leg1Credit), so the ceilings see
         // the debit amount alone - the same figure the submit ladder validated.
-        BigDecimal totalDebit = isTwoLeg(task) ? debitSide : debitSide.add(nvl(task.feeAmt()));
+        // THE CHARGE at release. Three things decide whether it is added to the debited
+        // total, and they are independent:
+        //   - a BENEFICIARY charge never is; it comes off the credit side, so the source
+        //     account is debited the principal alone;
+        //   - a two-leg task never is; the charge already rides inside the leg-1 credit
+        //     the frozen valas debit pays for, and adding it again would double-count it;
+        //   - everything else adds the IDR charge total to an IDR debit.
+        BigDecimal charge = chargeAtRelease(task, executedBy);
+        boolean chargeOnBeneficiary = ChargeService.ChargeBearer.BENEFICIARY.name()
+                .equalsIgnoreCase(task.chargeTo());
+        BigDecimal totalDebit = isTwoLeg(task) || chargeOnBeneficiary
+                ? debitSide : debitSide.add(charge);
 
         // Re-validate the two ceilings under FOR UPDATE before incrementing: usage moved
         // between submit and release. Only rows that exist bind - same resolution the
@@ -258,14 +287,11 @@ public class CoreExecutionServiceImpl implements ExecutionService {
             }
         }
 
-        // Usage increments at release - the recorded decision. Same transaction as the
-        // core call: a refusal rolls them back, a timeout commits them.
-        if (corpLimit != null) {
-            transferMapper.incrementCorpLimitUsage(corpLimit.id(), totalDebit);
-        }
-        if (groupLimit != null) {
-            transferMapper.incrementGroupLimitUsage(groupLimit.id(), totalDebit);
-        }
+        // NO usage increment here any more. The daily ceilings were CONSUMED at submit, as
+        // a reservation, so incrementing again at release would charge the company twice
+        // for one transfer. What release still does is give the reservation BACK when the
+        // instruction is refused - see fail(...) - while an UNKNOWN outcome keeps it,
+        // because the money may already have moved and reconciliation has not said yet.
 
         // P2: the ONLINE (RTOL / ATM Bersama) type rides the interbank switch protocol,
         // whose verdict carries a trace (RRN, response code) instead of a core journal.
@@ -375,6 +401,62 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         } catch (RuntimeException e) {
             throw new PostTransferException(outcome.retrievalRefNo(), e);
         }
+    }
+
+    /**
+     * The charge this release should book, in IDR.
+     *
+     * <p>Frozen at submit by default, and that default is the safe one: a task can wait
+     * days for its approvals, and the figure the approvers signed off is the figure that
+     * should be charged. {@code SYS_PARAM_CHARGE_FX_REQUOTE_ON_RELEASE} switches on a
+     * re-quote for the foreign-currency components, for a bank that would rather the
+     * customer paid today's rate.
+     *
+     * <p>Two guards make that switch safe to leave on. A rate that cannot be fetched
+     * leaves the frozen figure in place - a released transfer must not fail because this
+     * morning's rate has not landed. And a re-quote that moves the total further than
+     * {@code SYS_PARAM_CHARGE_FX_REQUOTE_TOLERANCE_PCT} is refused rather than booked:
+     * past that point the transfer being executed is not the one anybody approved.
+     */
+    private BigDecimal chargeAtRelease(ExecutionTaskRow task, String executedBy) {
+        BigDecimal frozen = nvl(task.feeAmt());
+        if (!chargeService.requoteOnRelease()) {
+            return frozen;
+        }
+        List<ChargeRows.ChargeRow> rows = chargeMapper.findCharges(task.id());
+        if (rows.isEmpty() || rows.stream().allMatch(
+                r -> ChargeServiceImpl.BASELINE_CCY.equalsIgnoreCase(r.ccyCd()))) {
+            return frozen;
+        }
+        List<ChargeService.ChargeComponent> components = rows.stream()
+                .map(r -> new ChargeService.ChargeComponent(r.seqNo(), r.chTypCd(), r.chTypNm(),
+                        r.ccyCd(), r.amt(), r.idrAmt(), r.fxRate(), r.fxRateType(),
+                        r.fxRateSide(), r.tariffSource()))
+                .toList();
+        ChargeService.ChargeQuote requoted;
+        try {
+            requoted = chargeService.requote(components);
+        } catch (RuntimeException e) {
+            log.warn("Task {}: charge re-quote failed ({}); keeping the approved charge",
+                    task.id(), e.getMessage());
+            return frozen;
+        }
+        BigDecimal drift = requoted.totalIdr().subtract(frozen).abs();
+        if (frozen.signum() > 0) {
+            BigDecimal driftPct = drift.multiply(HUNDRED).divide(frozen, 4, RoundingMode.HALF_UP);
+            if (driftPct.compareTo(chargeService.requoteTolerancePercent()) > 0) {
+                throw new CoreRefusedException(
+                        "Biaya berubah dari " + frozen.toPlainString() + " menjadi "
+                                + requoted.totalIdr().toPlainString()
+                                + " karena perubahan kurs; transaksi perlu diajukan ulang.");
+            }
+        }
+        for (ChargeService.ChargeComponent c : requoted.components()) {
+            chargeMapper.updateRequote(task.id(), c.seqNo(), c.idrAmt(), c.fxRate());
+        }
+        log.info("Task {} charge re-quoted {} -> {} by {}", task.id(), frozen,
+                requoted.totalIdr(), executedBy);
+        return requoted.totalIdr();
     }
 
     /**
@@ -795,8 +877,28 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                                  String status, String reason) {
         trxTaskMapper.markExecutionOutcome(task.id(), status, executedBy);
         insertExecuteAction(task, executedBy, reason);
+        releaseReservation(task, status);
         log.warn("Task {} landed {}: {}", task.id(), status, reason);
         return new ExecutionResult(status, reason);
+    }
+
+    /**
+     * Give the daily ceiling back, but ONLY on a verdict that says the money did not move.
+     *
+     * <p>{@code FAILED} means core banking refused, so nothing was spent and the company
+     * gets its headroom back. {@code UNKNOWN} means nobody knows yet: the instruction may
+     * well have gone through, and handing the ceiling back would let the customer send the
+     * same amount a second time. So an UNKNOWN task KEEPS its reservation until
+     * reconciliation settles it - which is the decision recorded for this path.
+     */
+    private void releaseReservation(ExecutionTaskRow task, String status) {
+        if (!"FAILED".equals(status)
+                || task.lmtSrvcCcyMtrxId() == null || task.lmtReservedAmt() == null) {
+            return;
+        }
+        limitService.release(task.corpId(), transferMapper.findUserGroupId(task.makerUserId()),
+                task.srvcCd(), new LimitService.Reservation(task.lmtSrvcCcyMtrxId(),
+                        task.lmtCcyMtrxCd(), task.lmtCcyCd(), task.lmtReservedAmt()));
     }
 
     private void insertExecuteAction(ExecutionTaskRow task, String executedBy, String note) {
