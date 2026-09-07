@@ -20,10 +20,17 @@ WORKDIR /workspace
 # edits — which are most edits — then reuse the resolved dependency layer instead of
 # re-downloading the world.
 COPY pom.xml .
-RUN mvn -B -q dependency:go-offline
+# The corporate Maven proxy. It has to arrive as a settings.xml rather than as
+# HTTP_PROXY/HTTPS_PROXY, which the Jenkins pipeline does pass as build args: Maven
+# resolves dependencies through Wagon, and Wagon reads its proxy from settings.xml
+# alone and ignores the environment. Without this file the two mvn steps below try to
+# reach Maven Central directly, which this network does not route - the build then
+# fails at "Build image" with a resolution error rather than anything about the code.
+COPY settings.xml .
+RUN mvn -B -q -s settings.xml dependency:go-offline
 
 COPY src ./src
-RUN mvn -B -q package -DskipTests
+RUN mvn -B -q -s settings.xml package -DskipTests
 
 # ---------- runtime ----------
 # Kept deliberately in step with infra/direct-infra/ship/Dockerfile.java, which is the

@@ -1,0 +1,12 @@
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+  <proxies>
+    <proxy>
+      <id>corp-proxy</id>
+      <active>true</active>
+      <protocol>http</protocol>
+      <host>192.168.98.199</host>
+      <port>8080</port>
+      <nonProxyHosts>localhost|127.0.0.1|*.bni.co.id</nonProxyHosts>
+    </proxy>
+  </proxies>
+</settings>
