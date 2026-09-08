@@ -97,7 +97,7 @@ class NotificationOutboxTest {
         assertThat(payload.get("currency").asText()).isEqualTo("IDR");
         assertThat(payload.get("status").asText()).isEqualTo("PENDING_APPROVAL");
         assertThat(payload.get("isError").asBoolean()).isFalse();
-        assertThat(payload.get("deepLink").asText()).isEqualTo("/transaksi/pending-task/" + TASK);
+        assertThat(payload.get("deepLink").asText()).isEqualTo("/task/pending-task?taskId=" + TASK);
         // An offset, unlike this service's HTTP timestamps: the value crosses a broker.
         assertThat(payload.get("occurredAt").asText())
                 .matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}");

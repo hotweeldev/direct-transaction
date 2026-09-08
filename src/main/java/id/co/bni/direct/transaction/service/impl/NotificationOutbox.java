@@ -12,6 +12,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
@@ -97,8 +99,16 @@ public class NotificationOutbox {
      */
     private static final DateTimeFormatter OCCURRED_AT = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 
-    /** The FE route the bell deep-links into. */
-    private static final String DEEP_LINK_PREFIX = "/transaksi/pending-task/";
+    /**
+     * The FE route the bell deep-links into.
+     *
+     * The task id travels as the QUERY PARAMETER `taskId`, not as a path segment. The
+     * corporate inbox is one exact route, /task/pending-task, and it opens a task in a
+     * modal rather than on a page of its own; there is no /:taskId route to match and a
+     * path segment therefore fell through the shell's catch-all straight to /login.
+     * PendingTaskPage reads this parameter on mount and opens that task.
+     */
+    private static final String DEEP_LINK_PREFIX = "/task/pending-task?taskId=";
 
     private final ExecutionOutboxMapper outboxMapper;
     private final TrxTaskMapper trxTaskMapper;
@@ -282,7 +292,8 @@ public class NotificationOutbox {
         event.put("currency", task.currency());
         event.put("status", task.status());
         event.put("isError", ERROR_EVENT_TYPES.contains(eventType));
-        event.put("deepLink", DEEP_LINK_PREFIX + task.taskId());
+        event.put("deepLink", DEEP_LINK_PREFIX
+                + URLEncoder.encode(task.taskId(), StandardCharsets.UTF_8));
         ArrayNode array = event.putArray("recipients");
         for (NotificationRecipientRow recipient : recipients) {
             ObjectNode node = array.addObject();
