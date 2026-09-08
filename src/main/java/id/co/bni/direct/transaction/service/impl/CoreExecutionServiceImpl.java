@@ -108,6 +108,7 @@ public class CoreExecutionServiceImpl implements ExecutionService {
     private final TransferTypeProperties transferTypeProperties;
     private final SimsemPool simsemPool;
     private final SimsemRefunder simsemRefunder;
+    private final NotificationOutbox notificationOutbox;
     private final TransactionTemplate ownTransaction;
 
     public CoreExecutionServiceImpl(TrxTaskMapper trxTaskMapper,
@@ -119,6 +120,7 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                                     TransferTypeProperties transferTypeProperties,
                                     SimsemPool simsemPool,
                                     SimsemRefunder simsemRefunder,
+                                    NotificationOutbox notificationOutbox,
                                     PlatformTransactionManager transactionManager) {
         this.trxTaskMapper = trxTaskMapper;
         this.chargeMapper = chargeMapper;
@@ -129,6 +131,7 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         this.transferTypeProperties = transferTypeProperties;
         this.simsemPool = simsemPool;
         this.simsemRefunder = simsemRefunder;
+        this.notificationOutbox = notificationOutbox;
         this.ownTransaction = new TransactionTemplate(transactionManager);
         this.ownTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
@@ -346,7 +349,7 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                     "Transfer berhasil. coreJournal=" + outcome.coreJournal());
             log.info("Task {} EXECUTED: journal={} trxRefNo={}",
                     task.id(), outcome.coreJournal(), trxRefNo);
-            return new ExecutionResult("EXECUTED", null);
+            return executed(task);
         } catch (RuntimeException e) {
             throw new PostTransferException(outcome.coreJournal(), e);
         }
@@ -397,7 +400,7 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                     "Transfer berhasil. retrievalRefNo=" + outcome.retrievalRefNo());
             log.info("Task {} EXECUTED (interbank): retrievalRefNo={} trxRefNo={}",
                     task.id(), outcome.retrievalRefNo(), trxRefNo);
-            return new ExecutionResult("EXECUTED", null);
+            return executed(task);
         } catch (RuntimeException e) {
             throw new PostTransferException(outcome.retrievalRefNo(), e);
         }
@@ -569,7 +572,7 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                             + leg2.coreJournal() + " journalLeg1=" + leg1.coreJournal());
             log.info("Task {} EXECUTED (two-leg): simsem={} leg1={} leg2={} trxRefNo={}",
                     task.id(), simsemAcct, leg1.coreJournal(), leg2.coreJournal(), trxRefNo);
-            return new ExecutionResult("EXECUTED", null);
+            return executed(task);
         } catch (RuntimeException e) {
             throw new PostTransferException(leg2.coreJournal(), e);
         }
@@ -637,7 +640,7 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                     "Pembayaran Virtual Account berhasil. journalNum=" + outcome.coreJournal());
             log.info("Task {} EXECUTED (virtual account): journalNum={} trxRefNo={}",
                     task.id(), outcome.coreJournal(), trxRefNo);
-            return new ExecutionResult("EXECUTED", null);
+            return executed(task);
         } catch (RuntimeException e) {
             throw new PostTransferException(outcome.coreJournal(), e);
         }
@@ -695,7 +698,7 @@ public class CoreExecutionServiceImpl implements ExecutionService {
                             + " trxId=" + outcome.trxId() + " endToEndId=" + outcome.endToEndId());
             log.info("Task {} EXECUTED (BI-Fast): journal={} trxId={} endToEndId={} trxRefNo={}",
                     task.id(), outcome.coreJournal(), outcome.trxId(), outcome.endToEndId(), trxRefNo);
-            return new ExecutionResult("EXECUTED", null);
+            return executed(task);
         } catch (RuntimeException e) {
             throw new PostTransferException(outcome.coreJournal(), e);
         }
@@ -878,8 +881,29 @@ public class CoreExecutionServiceImpl implements ExecutionService {
         trxTaskMapper.markExecutionOutcome(task.id(), status, executedBy);
         insertExecuteAction(task, executedBy, reason);
         releaseReservation(task, status);
+        notificationOutbox.transactionVerdict(notifiable(task, status), status);
         log.warn("Task {} landed {}: {}", task.id(), status, reason);
         return new ExecutionResult(status, reason);
+    }
+
+    /**
+     * The EXECUTED verdict, in one place because all five product paths reach it
+     * identically: the notification event is enqueued in whichever of the transactions
+     * above is open (always TX-B for a success), so it commits with the EXECUTED status,
+     * the BASE_FT row and the usage increments - or with none of them.
+     */
+    private ExecutionResult executed(ExecutionTaskRow task) {
+        notificationOutbox.transactionVerdict(notifiable(task, "EXECUTED"), "EXECUTED");
+        return new ExecutionResult("EXECUTED", null);
+    }
+
+    /** The task as a notification event describes it; {@code status} is the verdict. */
+    private static NotificationOutbox.NotifiableTask notifiable(ExecutionTaskRow task,
+                                                                String status) {
+        return new NotificationOutbox.NotifiableTask(
+                task.id(), task.corpId(), task.refNo(),
+                TransferServiceImpl.menuName(task.menuCd(), task.srvcCd()), task.srvcCd(),
+                task.trxAmt(), task.trxCcyCd(), status);
     }
 
     /**

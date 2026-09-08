@@ -89,6 +89,7 @@ public class ReconciliationServiceImpl implements ReconciliationService {
     private final CoreTransferClient coreTransferClient;
     private final SimsemRefunder simsemRefunder;
     private final TransferTypeProperties transferTypeProperties;
+    private final NotificationOutbox notificationOutbox;
     private final TransactionTemplate ownTransaction;
 
     public ReconciliationServiceImpl(TrxTaskMapper trxTaskMapper,
@@ -97,6 +98,7 @@ public class ReconciliationServiceImpl implements ReconciliationService {
                                      CoreTransferClient coreTransferClient,
                                      SimsemRefunder simsemRefunder,
                                      TransferTypeProperties transferTypeProperties,
+                                     NotificationOutbox notificationOutbox,
                                      PlatformTransactionManager transactionManager) {
         this.trxTaskMapper = trxTaskMapper;
         this.limitService = limitService;
@@ -104,6 +106,7 @@ public class ReconciliationServiceImpl implements ReconciliationService {
         this.coreTransferClient = coreTransferClient;
         this.simsemRefunder = simsemRefunder;
         this.transferTypeProperties = transferTypeProperties;
+        this.notificationOutbox = notificationOutbox;
         this.ownTransaction = new TransactionTemplate(transactionManager);
         this.ownTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
@@ -227,9 +230,22 @@ public class ReconciliationServiceImpl implements ReconciliationService {
                 + state.simsemAcctNo() + ". coreJournal=" + leg2.journalNo()
                 + " journalLeg1=" + state.journalNoSimsem();
         insertAction(task, actor, note);
+        // The verdict changed, so the people waiting on it are told - in THIS transaction,
+        // exactly as the execution seam does it. A reconciliation is the only other way a
+        // task reaches a terminal status, and a maker left on UNKNOWN would otherwise
+        // never hear that their transfer did land.
+        notifyVerdict(task, "EXECUTED");
         log.info("Task {} reconciled to EXECUTED: leg2 journal={} trxRefNo={}",
                 task.id(), leg2.journalNo(), trxRefNo);
         return new ReconcileResponse(task.id(), "EXECUTED", "LEG2_DONE", OUTCOME_EXECUTED, note);
+    }
+
+    /** The TRANSACTION_* event for a reconciled verdict; same recipients as an execution. */
+    private void notifyVerdict(ExecutionTaskRow task, String status) {
+        notificationOutbox.transactionVerdict(new NotificationOutbox.NotifiableTask(
+                task.id(), task.corpId(), task.refNo(),
+                TransferServiceImpl.menuName(task.menuCd(), task.srvcCd()), task.srvcCd(),
+                task.trxAmt(), task.trxCcyCd(), status), status);
     }
 
     /** The guarded verdict updated 0 rows - thrown to roll the finalizing transaction back. */
@@ -258,6 +274,7 @@ public class ReconciliationServiceImpl implements ReconciliationService {
                         new LimitService.Reservation(task.lmtSrvcCcyMtrxId(),
                                 task.lmtCcyMtrxCd(), task.lmtCcyCd(), task.lmtReservedAmt()));
             }
+            notifyVerdict(task, status);
             log.warn("Task {} reconciled to {} ({}): {}", task.id(), status, twoLegState, note);
             return new ReconcileResponse(task.id(), status, twoLegState, outcome, note);
         });

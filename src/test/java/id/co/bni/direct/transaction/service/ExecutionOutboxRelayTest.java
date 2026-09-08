@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import id.co.bni.direct.transaction.config.ExecutionProperties;
+import id.co.bni.direct.transaction.config.NotificationProperties;
 import id.co.bni.direct.transaction.entity.EventOutboxRows.PendingEventRow;
 import id.co.bni.direct.transaction.repository.mapper.ExecutionOutboxMapper;
 import id.co.bni.direct.transaction.service.impl.ExecutionOutboxRelay;
@@ -39,6 +40,7 @@ class ExecutionOutboxRelayTest {
     private ExecutionOutboxMapper outboxMapper;
     private KafkaTemplate<String, String> kafkaTemplate;
     private ExecutionProperties properties;
+    private NotificationProperties notificationProperties;
     private ExecutionOutboxRelay relay;
 
     @BeforeEach
@@ -48,8 +50,9 @@ class ExecutionOutboxRelayTest {
         kafkaTemplate = mock(KafkaTemplate.class);
         properties = new ExecutionProperties();
         properties.setMode("kafka");
+        notificationProperties = new NotificationProperties();
         relay = new ExecutionOutboxRelay(outboxMapper, kafkaTemplate, properties,
-                mock(PlatformTransactionManager.class));
+                notificationProperties, mock(PlatformTransactionManager.class));
     }
 
     private static PendingEventRow row(String id, int attempts) {
@@ -130,5 +133,62 @@ class ExecutionOutboxRelayTest {
         verify(outboxMapper).lockNewBatch(7);
         ArgumentCaptor<String> none = ArgumentCaptor.forClass(String.class);
         verify(kafkaTemplate, never()).send(none.capture(), anyString(), anyString());
+    }
+
+    // ---- Routing by EVENT_TYPE. The failure this guards against is not cosmetic: a
+    // notification event on the execution topic is read by ExecutionEventConsumer, which
+    // takes its taskId and executes the transfer.
+
+    @Test
+    void aNotificationEventGoesToTheNotificationTopic() {
+        PendingEventRow notification = new PendingEventRow(
+                "N1", "TASK_APPROVED", "T1", "{\"taskId\":\"T1\"}", 0);
+        when(outboxMapper.lockNewBatch(100)).thenReturn(List.of(notification));
+        when(kafkaTemplate.send(anyString(), anyString(), anyString())).thenReturn(acked());
+
+        assertThat(relay.drain()).isEqualTo(1);
+
+        verify(kafkaTemplate).send("direct.notification.events", "T1", "{\"taskId\":\"T1\"}");
+        verify(kafkaTemplate, never())
+                .send(eq("direct.transfer.execution.requested"), anyString(), anyString());
+        verify(outboxMapper).markSent("N1");
+    }
+
+    @Test
+    void oneDrainPassRoutesBothKindsToTheirOwnTopic() {
+        when(outboxMapper.lockNewBatch(100)).thenReturn(List.of(
+                row("E1", 0),
+                new PendingEventRow("N1", "TRANSACTION_EXECUTED", "T1", PAYLOAD, 0)));
+        when(kafkaTemplate.send(anyString(), anyString(), anyString())).thenReturn(acked());
+
+        assertThat(relay.drain()).isEqualTo(2);
+
+        verify(kafkaTemplate).send("direct.transfer.execution.requested", "T1", PAYLOAD);
+        verify(kafkaTemplate).send("direct.notification.events", "T1", PAYLOAD);
+    }
+
+    @Test
+    void theNotificationTopicIsConfigurable() {
+        notificationProperties.setTopic("dev.direct.notification.events");
+        when(outboxMapper.lockNewBatch(100)).thenReturn(List.of(
+                new PendingEventRow("N1", "TASK_RELEASED", "T1", PAYLOAD, 0)));
+        when(kafkaTemplate.send(anyString(), anyString(), anyString())).thenReturn(acked());
+
+        relay.drain();
+
+        verify(kafkaTemplate).send("dev.direct.notification.events", "T1", PAYLOAD);
+    }
+
+    /** No default topic: an unknown type is FAILED where someone will see it. */
+    @Test
+    void anUnroutableEventTypeIsFailedAndNeverPublished() {
+        when(outboxMapper.lockNewBatch(100)).thenReturn(List.of(
+                new PendingEventRow("X1", "SOMETHING_NEW", "T1", PAYLOAD, 0)));
+
+        assertThat(relay.drain()).isZero();
+
+        verify(outboxMapper).markFailed(eq("X1"), contains("SOMETHING_NEW"));
+        verify(kafkaTemplate, never()).send(anyString(), anyString(), anyString());
+        verify(outboxMapper, never()).markSent(anyString());
     }
 }

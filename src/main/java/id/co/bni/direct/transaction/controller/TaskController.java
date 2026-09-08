@@ -8,6 +8,7 @@ import id.co.bni.direct.transaction.dto.response.TaskResponses.BulkActionRespons
 import id.co.bni.direct.transaction.dto.response.TaskResponses.InboxResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.ReconcileResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.TaskActionResponse;
+import id.co.bni.direct.transaction.dto.response.TaskResponses.TaskSummaryResponse;
 import id.co.bni.direct.transaction.dto.response.TransferResponses.TaskDetailResponse;
 import id.co.bni.direct.transaction.security.RequiresPermission;
 import id.co.bni.direct.transaction.security.TokenIdentity;
@@ -72,6 +73,25 @@ public class TaskController {
             throw new IllegalArgumentException("Only status=PENDING is supported.");
         }
         return ResponseEntity.ok(taskApprovalService.inbox(companyId, userId));
+    }
+
+    /**
+     * The task badge: how many tasks this caller can act on, split by stage kind. Same
+     * authorization as the inbox and nothing more - {@code companyId} from the path scopes
+     * the query and the {@code userId} query parameter is bound to the token identity by
+     * {@code IdentityBindingInterceptor}, so a caller cannot count another user's inbox.
+     *
+     * <p>Mapped BEFORE {@code /{taskId}} for readability only; Spring prefers the literal
+     * path over the template regardless, so "summary" is never read as a task id.
+     *
+     * <p>The FE polls this every 30 seconds per open tab, in the same interval as the
+     * notification summary. It is one aggregate COUNT and must stay one - if this ever
+     * needs task rows to answer, it has stopped being a badge.
+     */
+    @GetMapping("/summary")
+    public ResponseEntity<TaskSummaryResponse> summary(@PathVariable String companyId,
+                                                       @RequestParam String userId) {
+        return ResponseEntity.ok(taskApprovalService.summary(companyId, userId));
     }
 
     /** Task detail with stages and their action history - same shape as /transfers/{taskId}. */

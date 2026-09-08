@@ -161,6 +161,17 @@ app:
     # Parallel listener threads; the VERSION-guarded claim makes concurrency safe.
     concurrency: ${EXECUTION_CONCURRENCY:3}
 
+  notification:
+    # Where TRX_EVENT_OUTBOX's notification rows go. A SECOND topic, deliberately: the
+    # relay routes each row by EVENT_TYPE, and a notification event delivered to
+    # topic-requested would be picked up by ExecutionEventConsumer and executed.
+    #
+    # Notification rows are written in EVERY execution mode (they belong to the workflow
+    # commit, not to the execution pipeline) but only a relay with a broker drains them -
+    # and the relay only exists when mode=kafka. On a laptop running the default sync mode
+    # the rows therefore accumulate STATUS='NEW' and no notification is ever delivered.
+    # That is expected; see NotificationOutbox.
+    topic: ${NOTIFICATION_TOPIC:direct.notification.events}
 
   transfer:
     # P1 domestic-transfer constants. Fees are the flat placeholder until the P4 charge

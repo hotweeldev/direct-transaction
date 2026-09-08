@@ -37,6 +37,17 @@ public final class TaskResponses {
             MyStageResponse myStage) {
     }
 
+    /**
+     * GET /tasks/summary - the bell/badge counts, polled every 30 seconds by every open
+     * browser tab. {@code actionable} is the number of tasks where the caller is a
+     * candidate of the currently ACTIVE stage and has not acted on it yet;
+     * {@code pendingApproval} and {@code pendingRelease} are that same set split by the
+     * kind of stage, so the two always add up to {@code actionable}. Counts only - the
+     * list behind them is GET /tasks.
+     */
+    public record TaskSummaryResponse(int pendingApproval, int pendingRelease, int actionable) {
+    }
+
     /** The stage the inbox user is a candidate on. */
     public record MyStageResponse(
             Integer seqNo,

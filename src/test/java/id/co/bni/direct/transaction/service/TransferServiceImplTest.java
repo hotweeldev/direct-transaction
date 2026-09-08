@@ -27,7 +27,12 @@ import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient.Verifica
 import id.co.bni.direct.transaction.repository.mapper.ChargeMapper;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import id.co.bni.direct.transaction.entity.EventOutboxRows;
+import com.fasterxml.jackson.databind.JsonNode;
+import id.co.bni.direct.transaction.repository.mapper.ExecutionOutboxMapper;
 import id.co.bni.direct.transaction.service.impl.ExecutionOutbox;
+import id.co.bni.direct.transaction.service.impl.NotificationOutbox;
 import id.co.bni.direct.transaction.service.impl.TransferServiceImpl;
 import id.co.bni.direct.transaction.service.TransferType;
 import org.junit.jupiter.api.BeforeEach;
@@ -67,6 +72,8 @@ class TransferServiceImplTest {
     private UmasAuthenticatorClient authenticatorClient;
     private ExecutionService executionService;
     private ExecutionOutbox executionOutbox;
+    private ExecutionOutboxMapper outboxMapper;
+    private NotificationOutbox notificationOutbox;
     private CoreTransferClient coreTransferClient;
     private TransferServiceImpl service;
 
@@ -108,6 +115,11 @@ class TransferServiceImplTest {
         executionService = mock(ExecutionService.class);
         // Mockito default: isKafkaMode() answers false = sync mode, today's behavior.
         executionOutbox = mock(ExecutionOutbox.class);
+        outboxMapper = mock(ExecutionOutboxMapper.class);
+        // The REAL NotificationOutbox: the TASK_SUBMITTED row it writes must be produced
+        // from inside the submit transaction, over the candidate rows that transaction
+        // has just inserted - a mock would hide both.
+        notificationOutbox = new NotificationOutbox(outboxMapper, trxTaskMapper, new ObjectMapper());
         coreTransferClient = mock(CoreTransferClient.class);
         chargeMapper = mock(ChargeMapper.class);
         chargeService = stubChargeService();
@@ -119,7 +131,7 @@ class TransferServiceImplTest {
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
                 chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
-                executionService, executionOutbox, new TransferTypeProperties(),
+                executionService, executionOutbox, notificationOutbox, new TransferTypeProperties(),
                 mock(PlatformTransactionManager.class));
     }
 
@@ -278,6 +290,27 @@ class TransferServiceImplTest {
         assertThat(task.getValue().currentStageSeq()).isNull();
         // Sync mode regression: nothing is queued into the outbox.
         verify(executionOutbox, never()).enqueueExecutionRequested(anyString(), any(), any());
+    }
+
+    // The new matrix guards are for MULTI-USER companies only. A cash-lite single-user
+    // company never reads the matrix, so a band with no signatures and a signature with
+    // no approval level must both leave its fast path completely untouched.
+    @Test
+    void aSingleUserCompanyStillSubmitsWithAnUnconfiguredApprovalMatrix() {
+        stubHappyPath();
+        when(transferMapper.findCorpFlags(COMPANY)).thenReturn(new CorpFlagsRow("Y", "Y"));
+        when(transferMapper.findBandSignatures("BAND1")).thenReturn(List.of());
+        when(executionService.execute(anyString()))
+                .thenReturn(new ExecutionService.ExecutionResult("EXECUTED", null));
+
+        var response = service.submit(COMPANY, "budi", request("10000000"));
+
+        assertThat(response.status()).isEqualTo("EXECUTED");
+        verify(transferMapper, never()).findBandSignatures(anyString());
+        verify(trxTaskMapper, never()).insertStage(any());
+        ArgumentCaptor<TrxTaskRows.TaskInsert> task = ArgumentCaptor.forClass(TrxTaskRows.TaskInsert.class);
+        verify(trxTaskMapper).insertTask(task.capture());
+        assertThat(task.getValue().isSingleUser()).isEqualTo("Y");
     }
 
     @Test
@@ -494,17 +527,32 @@ class TransferServiceImplTest {
                 .containsExactly("cici");
     }
 
+    // A null aprvLvlCd is what findBandSignatures' LEFT JOIN returns when the approval
+    // limit scheme was never created. This used to be read as "any level" - every AP-role
+    // user became a candidate and the stage was written with a null APRV_LVL_CD. For a
+    // multi-user company that is an undetermined workflow, so the submit is refused.
     @Test
-    void aNullStageLevelAcceptsApproversOfAnyLevel() {
+    void aNullStageLevelIsRejectedBecauseTheApprovalSchemeIsUnconfigured() {
         stubHappyPath();
         when(transferMapper.findBandSignatures("BAND1")).thenReturn(List.of(
                 new MatrixSignatureRow(1, 1, null, "1", null)));
 
-        var candidates = submittedCandidates("10000000");
+        assertRejectedWith("NO_APRV_LVL_SCHEME", "10000000");
+        verify(transferMapper, never()).lockRefNoValue(anyString(), anyString());
+        verify(trxTaskMapper, never()).insertStage(any());
+        verify(trxTaskMapper, never()).insertCandidate(any());
+    }
 
-        assertThat(candidates.stream().filter(c -> c.stageSeq() == 1)
-                .map(TrxTaskRows.CandidateInsert::userId))
-                .containsExactly("ani", "cici", "dodi");
+    // A band with no signature rows used to fall through to PENDING_RELEASE, skipping
+    // approval entirely for a multi-user company.
+    @Test
+    void aBandWithNoSignaturesIsRejectedInsteadOfSkippingApproval() {
+        stubHappyPath();
+        when(transferMapper.findBandSignatures("BAND1")).thenReturn(List.of());
+
+        assertRejectedWith("NO_MATRIX_SIGNATURE", "10000000");
+        verify(transferMapper, never()).lockRefNoValue(anyString(), anyString());
+        verify(trxTaskMapper, never()).insertStage(any());
     }
 
     @Test
@@ -1397,7 +1445,7 @@ class TransferServiceImplTest {
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
                 chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
-                executionService, executionOutbox, props,
+                executionService, executionOutbox, notificationOutbox, props,
                 mock(PlatformTransactionManager.class));
         when(coreTransferClient.inquireVa(anyString(), eq(VA_NUMBER), eq(SOURCE)))
                 .thenReturn(new CoreTransferClient.VaInquiry(VA_NUMBER, "INQ-123",
@@ -1785,7 +1833,7 @@ class TransferServiceImplTest {
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
                 chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
-                executionService, executionOutbox, props,
+                executionService, executionOutbox, notificationOutbox, props,
                 mock(PlatformTransactionManager.class));
         when(coreTransferClient.inquireVa(anyString(), eq(VA_NUMBER), eq(SOURCE)))
                 .thenReturn(new CoreTransferClient.VaInquiry(VA_NUMBER, null, "test66666",
@@ -1818,7 +1866,7 @@ class TransferServiceImplTest {
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
                 chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
-                executionService, executionOutbox, props,
+                executionService, executionOutbox, notificationOutbox, props,
                 mock(PlatformTransactionManager.class));
         when(coreTransferClient.inquireVa(anyString(), eq(VA_NUMBER), eq(SOURCE)))
                 .thenReturn(new CoreTransferClient.VaInquiry(VA_NUMBER, "INQ-1",
@@ -1839,7 +1887,7 @@ class TransferServiceImplTest {
         service = new TransferServiceImpl(transferMapper, trxTaskMapper,
                 chargeMapper, chargeService, limitService,
                 accountNameClient, coreTransferClient, authenticatorClient,
-                executionService, executionOutbox, props,
+                executionService, executionOutbox, notificationOutbox, props,
                 mock(PlatformTransactionManager.class));
 
         service.submit(COMPANY, "budi", vaRequestWithBill("150000", openBill("2500")));
@@ -1902,5 +1950,65 @@ class TransferServiceImplTest {
         assertThat(frozen.accountNumberTo()).isEqualTo("1000665901");
         assertThat(frozen.additionalLabel1()).isEqualTo("Periode");
         assertThat(frozen.additionalValue1()).isEqualTo("2026-09");
+    }
+
+    // ---- TASK_SUBMITTED (notification contract sections 0 and 1) ----
+
+    @Test
+    void aSubmitEnqueuesTaskSubmittedForTheFirstStagesCandidates() throws Exception {
+        stubHappyPath();
+        when(trxTaskMapper.findNotificationCandidates(anyString(), eq(1))).thenReturn(List.of(
+                new TrxTaskRows.NotificationRecipientRow("CU2", "ani", "ANI LESTARI", "APPROVER"),
+                new TrxTaskRows.NotificationRecipientRow("CU3", "cici", "CICI PARAMIDA", "APPROVER")));
+
+        var response = service.submit(COMPANY, "budi", request("10000000"));
+
+        ArgumentCaptor<EventOutboxRows.OutboxInsert> row =
+                ArgumentCaptor.forClass(EventOutboxRows.OutboxInsert.class);
+        verify(outboxMapper).insert(row.capture());
+        assertThat(row.getValue().eventType()).isEqualTo("TASK_SUBMITTED");
+        assertThat(row.getValue().aggregateId()).isEqualTo(response.taskId());
+
+        JsonNode payload = new ObjectMapper().readTree(row.getValue().payload());
+        assertThat(payload.get("corpId").asText()).isEqualTo(COMPANY);
+        assertThat(payload.get("refNo").asText()).isEqualTo(response.refNo());
+        assertThat(payload.get("status").asText()).isEqualTo("PENDING_APPROVAL");
+        assertThat(payload.get("serviceCode").asText())
+                .isEqualTo(TransferServiceImpl.SRVC_IN_HOUSE_3RD);
+        assertThat(payload.get("recipients").findValuesAsText("userId"))
+                .containsExactly("CU2", "CU3");
+        // Stage 1 only: the release stage's candidates hear about it when it opens.
+        verify(trxTaskMapper, never()).findNotificationCandidates(anyString(), eq(2));
+    }
+
+    /**
+     * Notification rows are written in sync mode too - they belong to the workflow commit,
+     * not to the execution pipeline. (They then sit NEW until a relay with a broker drains
+     * them; on a laptop that never happens, which is the documented behaviour.) The
+     * execution outbox, by contrast, stays untouched in sync mode.
+     */
+    @Test
+    void notificationRowsAreWrittenInSyncModeWhileTheExecutionOutboxStaysUntouched() {
+        stubHappyPath();
+        when(trxTaskMapper.findNotificationCandidates(anyString(), eq(1))).thenReturn(List.of(
+                new TrxTaskRows.NotificationRecipientRow("CU2", "ani", "ANI LESTARI", "APPROVER")));
+
+        service.submit(COMPANY, "budi", request("10000000"));
+
+        verify(outboxMapper).insert(any());
+        verify(executionOutbox, never()).enqueueExecutionRequested(anyString(), any(), any());
+    }
+
+    /** A single-user task runs no workflow, so TASK_SUBMITTED has nobody to address. */
+    @Test
+    void aSingleUserSubmitEnqueuesNoTaskSubmitted() {
+        stubHappyPath();
+        when(transferMapper.findCorpFlags(COMPANY)).thenReturn(new CorpFlagsRow("Y", "Y"));
+        when(executionService.execute(anyString()))
+                .thenReturn(new ExecutionService.ExecutionResult("EXECUTED", null));
+
+        service.submit(COMPANY, "budi", request("10000000"));
+
+        verify(outboxMapper, never()).insert(any());
     }
 }

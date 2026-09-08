@@ -10,10 +10,12 @@ import id.co.bni.direct.transaction.dto.response.TaskResponses.InboxItemResponse
 import id.co.bni.direct.transaction.dto.response.TaskResponses.InboxResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.MyStageResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.TaskActionResponse;
+import id.co.bni.direct.transaction.dto.response.TaskResponses.TaskSummaryResponse;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.ActionInsert;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.CandidateRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.StageRow;
 import id.co.bni.direct.transaction.entity.TrxTaskRows.TaskRow;
+import id.co.bni.direct.transaction.entity.TrxTaskRows.TaskSummaryRow;
 import id.co.bni.direct.transaction.exception.BulkAbortedException;
 import id.co.bni.direct.transaction.exception.BusinessRuleException;
 import id.co.bni.direct.transaction.exception.NotFoundException;
@@ -60,6 +62,7 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
     private final UmasAuthenticatorClient authenticatorClient;
     private final ExecutionService executionService;
     private final ExecutionOutbox executionOutbox;
+    private final NotificationOutbox notificationOutbox;
     private final TransactionTemplate workflowTransaction;
     /** Configurable rather than a constant so it can be lowered without a release. */
     private final int bulkMaxSize;
@@ -70,6 +73,7 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
                                    UmasAuthenticatorClient authenticatorClient,
                                    ExecutionService executionService,
                                    ExecutionOutbox executionOutbox,
+                                   NotificationOutbox notificationOutbox,
                                    PlatformTransactionManager transactionManager,
                                    @Value("${app.tasks.bulk-max-size:50}") int bulkMaxSize) {
         this.trxTaskMapper = trxTaskMapper;
@@ -78,6 +82,7 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
         this.authenticatorClient = authenticatorClient;
         this.executionService = executionService;
         this.executionOutbox = executionOutbox;
+        this.notificationOutbox = notificationOutbox;
         this.workflowTransaction = new TransactionTemplate(transactionManager);
         this.bulkMaxSize = bulkMaxSize;
     }
@@ -95,6 +100,18 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
                                 row.requiredCount(), row.completedCount())))
                 .toList();
         return new InboxResponse(items);
+    }
+
+    /**
+     * The badge. One aggregate query, no task list built and none cached: the counts must
+     * be exact the moment an approver acts in another tab, and a 30-second poll of a
+     * three-number COUNT is cheaper than any invalidation scheme that guarantees that.
+     */
+    @Override
+    public TaskSummaryResponse summary(String companyId, String userId) {
+        TaskSummaryRow row = trxTaskMapper.findTaskSummary(companyId, userId);
+        return new TaskSummaryResponse(row.pendingApproval(), row.pendingRelease(),
+                row.actionable());
     }
 
     /**
@@ -176,9 +193,34 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
             trxTaskMapper.updateStageStatus(taskId, nextStage.seqNo(), "ACTIVE", actor);
         }
 
+        // Same transaction as everything above (see NotificationOutbox): the event about
+        // this approval commits with the approval or not at all. A release that completes
+        // the workflow is TASK_RELEASED - the workflow is over and only the maker is
+        // waiting on it; anything else is TASK_APPROVED, addressed to whoever the task is
+        // now waiting on plus the maker. The stage seq handed over is the one the task
+        // sits on AFTER this write: the next stage when this action completed the current
+        // one, the same stage when a multi-signature level is still short.
+        NotificationOutbox.NotifiableTask notifiable =
+                notifiable(companyId, task, newStatus);
+        if ("RELEASE".equals(action) && stageDone) {
+            notificationOutbox.taskReleased(notifiable);
+        } else {
+            notificationOutbox.taskApproved(notifiable,
+                    stageDone ? newStageSeq : stage.seqNo());
+        }
+
         log.info("Task {} {} by {}: status {} -> {}", taskId, action, userId,
                 task.status(), newStatus);
         return newStatus;
+    }
+
+    /** The task as a notification event describes it; {@code status} is post-change. */
+    private static NotificationOutbox.NotifiableTask notifiable(String companyId, TaskRow task,
+                                                                String status) {
+        return new NotificationOutbox.NotifiableTask(
+                task.id(), companyId, task.refNo(),
+                TransferServiceImpl.menuName(task.menuCd(), task.srvcCd()), task.srvcCd(),
+                task.trxAmt(), task.trxCcyCd(), status);
     }
 
     @Override
@@ -204,6 +246,10 @@ public class TaskApprovalServiceImpl implements TaskApprovalService {
         insertAction(taskId, acting.stage().seqNo(), "REJECT", userId,
                 acting.candidate(), acting.otpVerificationId(), note);
         trxTaskMapper.closeOpenStages(taskId, actor);
+        // After insertAction on purpose: the contract's recipients are the maker "plus
+        // everyone who already acted", and by the time the task is rejected the rejecter
+        // is one of them.
+        notificationOutbox.taskRejected(notifiable(companyId, acting.task(), "REJECTED"));
         log.info("Task {} REJECTED by {}", taskId, userId);
     }
 

@@ -1,6 +1,7 @@
 package id.co.bni.direct.transaction.service.impl;
 
 import id.co.bni.direct.transaction.config.ExecutionProperties;
+import id.co.bni.direct.transaction.config.NotificationProperties;
 import id.co.bni.direct.transaction.entity.EventOutboxRows.PendingEventRow;
 import id.co.bni.direct.transaction.repository.mapper.ExecutionOutboxMapper;
 import org.slf4j.Logger;
@@ -28,6 +29,14 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>At-least-once by construction: a crash between broker-ack and markSent re-sends the
  * row - the consumer's QUEUED->EXECUTING VERSION claim makes the duplicate a no-op.
+ *
+ * <p><b>ROUTING IS BY EVENT_TYPE</b>, not by table. TRX_EVENT_OUTBOX now carries two
+ * unrelated kinds of event and they go to two different topics and two different consumer
+ * services: EXECUTION_REQUESTED to {@code app.execution.topic-requested}, every
+ * notification event to {@code app.notification.topic}. A notification event on the
+ * execution topic is not a cosmetic mistake - {@code ExecutionEventConsumer} would read
+ * its taskId and try to execute the task. An event type this relay does not recognise is
+ * therefore FAILED on the spot and alerted rather than sent anywhere: no default topic.
  */
 @Component
 @ConditionalOnProperty(prefix = "app.execution", name = "mode", havingValue = "kafka")
@@ -41,15 +50,18 @@ public class ExecutionOutboxRelay {
     private final ExecutionOutboxMapper outboxMapper;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ExecutionProperties properties;
+    private final NotificationProperties notificationProperties;
     private final TransactionTemplate drainTransaction;
 
     public ExecutionOutboxRelay(ExecutionOutboxMapper outboxMapper,
                                 KafkaTemplate<String, String> executionKafkaTemplate,
                                 ExecutionProperties properties,
+                                NotificationProperties notificationProperties,
                                 PlatformTransactionManager transactionManager) {
         this.outboxMapper = outboxMapper;
         this.kafkaTemplate = executionKafkaTemplate;
         this.properties = properties;
+        this.notificationProperties = notificationProperties;
         this.drainTransaction = new TransactionTemplate(transactionManager);
     }
 
@@ -79,9 +91,34 @@ public class ExecutionOutboxRelay {
         return sent != null ? sent : 0;
     }
 
+    /**
+     * The topic this row belongs on, or null when nothing claims it. Never falls back to
+     * a topic: see the class comment on why a wrong guess here executes a transfer.
+     */
+    private String topicFor(String eventType) {
+        if (ExecutionOutbox.EVENT_EXECUTION_REQUESTED.equals(eventType)) {
+            return properties.getTopicRequested();
+        }
+        if (NotificationOutbox.isNotificationEvent(eventType)) {
+            return notificationProperties.getTopic();
+        }
+        return null;
+    }
+
     private boolean relay(PendingEventRow row) {
+        String topic = topicFor(row.eventType());
+        if (topic == null) {
+            // Written by a version of this service that knew an event type this one does
+            // not - a rollback mid-release, or a hand-inserted row. FAILED rather than
+            // retried forever, and loud: nobody is going to receive it until someone looks.
+            outboxMapper.markFailed(row.id(), "Unroutable event type: " + row.eventType());
+            log.error("Outbox event {} (task {}) has no topic for EVENT_TYPE {} - marked "
+                            + "FAILED, nothing was published.",
+                    row.id(), row.aggregateId(), row.eventType());
+            return false;
+        }
         try {
-            kafkaTemplate.send(properties.getTopicRequested(), row.aggregateId(), row.payload())
+            kafkaTemplate.send(topic, row.aggregateId(), row.payload())
                     .get(properties.getSendTimeoutMs(), TimeUnit.MILLISECONDS);
             outboxMapper.markSent(row.id());
             return true;

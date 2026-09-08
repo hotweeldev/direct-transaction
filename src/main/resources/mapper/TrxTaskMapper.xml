@@ -228,6 +228,109 @@
         ORDER BY t.CREATED_DT DESC, t.ID
     </select>
 
+    <!-- The task badge. Deliberately the SAME join and predicate set as findInbox - the
+         badge and the list it opens must never disagree - but aggregated, so no task row
+         is ever materialized. One row always comes back (COUNT over an empty join is 0),
+         so the service needs no null handling.
+
+         COUNT(CASE ...) rather than three separate queries: the expensive part is the
+         candidate/stage/action join, and doing it once and bucketing in the SELECT list
+         costs one pass (COUNT ignores the NULL the CASE falls through to). V14 adds the two composite indexes that keep this pass off the
+         tables (see that migration's header). -->
+    <select id="findTaskSummary" resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$TaskSummaryRow">
+        SELECT COUNT(CASE WHEN s.STAGE_TYPE = N'APPROVAL' THEN 1 END) AS "pendingApproval",
+               COUNT(CASE WHEN s.STAGE_TYPE = N'RELEASE' THEN 1 END)  AS "pendingRelease",
+               COUNT(*)                                               AS "actionable"
+        FROM TRX_TASK t
+        JOIN TRX_TASK_STAGE s
+          ON s.TRX_TASK_ID = t.ID
+         AND s.SEQ_NO = t.CURRENT_STAGE_SEQ
+         AND s.STATUS = N'ACTIVE'
+        JOIN TRX_TASK_CANDIDATE c
+          ON c.TRX_TASK_ID = t.ID
+         AND c.STAGE_SEQ = s.SEQ_NO
+         AND c.USER_ID = #{userId}
+        WHERE t.CORP_ID = #{companyId}
+          AND t.STATUS IN (N'PENDING_APPROVAL', N'PENDING_RELEASE')
+          AND NOT EXISTS (SELECT 1
+                          FROM TRX_TASK_ACTION a
+                          WHERE a.TRX_TASK_ID = t.ID
+                            AND a.STAGE_SEQ = s.SEQ_NO
+                            AND a.ACTOR_USER_ID = c.CORP_USR_ID)
+    </select>
+
+    <!-- Notification recipients. All three run INSIDE the workflow transaction that
+         caused the event, so they read the candidate/action rows that transaction has
+         just written but not yet committed - which is the point: the consumer must never
+         query TRX_TASK, and re-reading after the commit would race the next actor.
+
+         BOTH ID SPACES TRAVEL, always: "userId" is CORP_USR.ID (the stable surrogate the
+         action rows and TRX_TASK.MAKER_USER_ID store) and "loginId" is CORP_USR.USER_ID
+         (the login name a UMAS token carries in its user_id claim). direct-notification
+         matches a caller against either column, so dropping the login id would leave a
+         user unable to see their own notifications - a failure invisible to either
+         service's unit tests. TRX_TASK_CANDIDATE carries both; the other two statements
+         reach CORP_USR for the login half. -->
+
+    <!-- TRX_TASK_CANDIDATE has USER_ID and CORP_USR_ID both NOT NULL, so neither id space
+         can come back empty here. -->
+    <select id="findNotificationCandidates"
+            resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$NotificationRecipientRow">
+        SELECT c.CORP_USR_ID AS "userId",
+               c.USER_ID     AS "loginId",
+               c.USER_NAME   AS "userName",
+               CASE WHEN s.STAGE_TYPE = N'RELEASE' THEN N'RELEASER' ELSE N'APPROVER' END AS "role"
+        FROM TRX_TASK_CANDIDATE c
+        JOIN TRX_TASK_STAGE s
+          ON s.TRX_TASK_ID = c.TRX_TASK_ID
+         AND s.SEQ_NO = c.STAGE_SEQ
+        WHERE c.TRX_TASK_ID = #{taskId}
+          AND c.STAGE_SEQ = #{stageSeq}
+        ORDER BY c.USER_ID
+    </select>
+
+    <select id="findNotificationMaker"
+            resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$NotificationRecipientRow">
+        SELECT t.MAKER_USER_ID   AS "userId",
+               u.USER_ID         AS "loginId",
+               t.MAKER_USER_NAME AS "userName",
+               N'MAKER'          AS "role"
+        FROM TRX_TASK t
+        LEFT JOIN CORP_USR u
+          ON u.ID = t.MAKER_USER_ID
+        WHERE t.ID = #{taskId}
+    </select>
+
+    <!-- SUBMIT rows carry a null STAGE_SEQ, so the inner join to TRX_TASK_STAGE drops
+         them - the maker is added by findNotificationMaker, with the MAKER role, not as
+         an actor. DISTINCT collapses a repeated action row; a person who both approved
+         and released still comes back twice (two roles), which NotificationOutbox folds
+         into one recipient - one person is one notification. -->
+    <select id="findNotificationActors"
+            resultType="id.co.bni.direct.transaction.entity.TrxTaskRows$NotificationRecipientRow">
+        SELECT DISTINCT
+               a.ACTOR_USER_ID              AS "userId",
+               COALESCE(c.USER_ID, u.USER_ID) AS "loginId",
+               a.ACTOR_USER_NAME            AS "userName",
+               CASE WHEN s.STAGE_TYPE = N'RELEASE' THEN N'RELEASER' ELSE N'APPROVER' END AS "role"
+        FROM TRX_TASK_ACTION a
+        JOIN TRX_TASK_STAGE s
+          ON s.TRX_TASK_ID = a.TRX_TASK_ID
+         AND s.SEQ_NO = a.STAGE_SEQ
+        LEFT JOIN TRX_TASK_CANDIDATE c
+          ON c.TRX_TASK_ID = a.TRX_TASK_ID
+         AND c.STAGE_SEQ = a.STAGE_SEQ
+         AND c.CORP_USR_ID = a.ACTOR_USER_ID
+        LEFT JOIN CORP_USR u
+          ON u.ID = a.ACTOR_USER_ID
+        WHERE a.TRX_TASK_ID = #{taskId}
+          AND a.ACTION IN
+        <foreach item="action" collection="actions" open="(" separator="," close=")">
+            #{action}
+        </foreach>
+        ORDER BY "userId", "role"
+    </select>
+
     <!-- The optimistic claim: 0 rows back means someone else's approve/reject landed
          between this caller's read and their write - answered as a 422, never a double
          count. Every state change of a task goes through here, so a matching VERSION

@@ -6,11 +6,19 @@ import id.co.bni.direct.transaction.dto.request.TaskRequests.RejectTaskRequest;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.BulkActionResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.InboxResponse;
 import id.co.bni.direct.transaction.dto.response.TaskResponses.TaskActionResponse;
+import id.co.bni.direct.transaction.dto.response.TaskResponses.TaskSummaryResponse;
 
 /** The approval phase: the candidate inbox, approve (or release), and reject. */
 public interface TaskApprovalService {
 
     InboxResponse inbox(String companyId, String userId);
+
+    /**
+     * The badge counts behind {@link #inbox}: the same set of tasks, counted rather than
+     * listed. Its own method (and its own single aggregate query) because the FE polls it
+     * every 30 seconds and must never pay for building an inbox to get three numbers.
+     */
+    TaskSummaryResponse summary(String companyId, String userId);
 
     TaskActionResponse approve(String companyId, String actor, String taskId,
                                ApproveTaskRequest request);

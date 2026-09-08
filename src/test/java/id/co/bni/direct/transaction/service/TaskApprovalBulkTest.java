@@ -16,6 +16,7 @@ import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient.Verifica
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
 import id.co.bni.direct.transaction.service.impl.ExecutionOutbox;
+import id.co.bni.direct.transaction.service.impl.NotificationOutbox;
 import id.co.bni.direct.transaction.service.impl.TaskApprovalServiceImpl;
 import id.co.bni.direct.transaction.service.impl.TransferServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
@@ -63,7 +64,8 @@ class TaskApprovalBulkTest {
         executionOutbox = mock(ExecutionOutbox.class);
         service = new TaskApprovalServiceImpl(trxTaskMapper, mock(TransferMapper.class),
                 mock(LimitService.class), authenticatorClient,
-                executionService, executionOutbox, mock(PlatformTransactionManager.class), 50);
+                executionService, executionOutbox, mock(NotificationOutbox.class),
+                mock(PlatformTransactionManager.class), 50);
         when(authenticatorClient.verifyTransaction("ani", "CH-9", "654321"))
                 .thenReturn(new Verification(true, "VER-9"));
         when(trxTaskMapper.updateTaskProgress(anyString(), any(), anyString(), any(), anyString()))
@@ -236,7 +238,8 @@ class TaskApprovalBulkTest {
     void aBatchOverTheConfiguredCeilingIsRefused() {
         var small = new TaskApprovalServiceImpl(trxTaskMapper, mock(TransferMapper.class),
                 mock(LimitService.class), authenticatorClient,
-                executionService, executionOutbox, mock(PlatformTransactionManager.class), 2);
+                executionService, executionOutbox, mock(NotificationOutbox.class),
+                mock(PlatformTransactionManager.class), 2);
 
         assertThatThrownBy(() -> small.bulkApprove(COMPANY, "ani", bulk(List.of("T1", "T2", "T3"), null, false)))
                 .isInstanceOf(BusinessRuleException.class)

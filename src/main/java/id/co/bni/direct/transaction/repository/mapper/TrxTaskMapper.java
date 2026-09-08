@@ -60,6 +60,39 @@ public interface TrxTaskMapper {
                                          @Param("userId") String userId);
 
     /**
+     * The task badge (contract §4): one indexed COUNT over the same joins as
+     * {@link #findInbox}, split by stage type. Never builds a list - it is polled every
+     * 30 seconds by every open browser tab.
+     */
+    TrxTaskRows.TaskSummaryRow findTaskSummary(@Param("companyId") String companyId,
+                                               @Param("userId") String userId);
+
+    // ---- Notification recipients (resolved producer-side, in the workflow transaction) ----
+
+    /**
+     * The frozen candidates of one stage, as notification addressees; the role comes from
+     * the stage type (RELEASE -> RELEASER, otherwise APPROVER). Reads TRX_TASK_CANDIDATE
+     * only - the eligible set is never re-derived from the live role tables (V2).
+     */
+    List<TrxTaskRows.NotificationRecipientRow> findNotificationCandidates(
+            @Param("taskId") String taskId, @Param("stageSeq") Integer stageSeq);
+
+    /**
+     * The task's maker, off TRX_TASK.MAKER_USER_ID. CORP_USR is LEFT joined for the login
+     * id alone (TRX_TASK stores the surrogate, not the login id, precisely because the
+     * login id can be renamed while a task is in flight); a missing user row costs the
+     * support field, never the notification.
+     */
+    TrxTaskRows.NotificationRecipientRow findNotificationMaker(@Param("taskId") String taskId);
+
+    /**
+     * Everyone who has already acted on the task in one of the given actions, deduplicated.
+     * The login id comes from the actor's own candidate row on the stage they acted in.
+     */
+    List<TrxTaskRows.NotificationRecipientRow> findNotificationActors(
+            @Param("taskId") String taskId, @Param("actions") List<String> actions);
+
+    /**
      * The optimistic claim every approve/reject makes: moves the task to its new status
      * and stage ONLY when VERSION still matches what the caller read. 0 rows updated
      * means a concurrent actor got there first - the double-approve guard.

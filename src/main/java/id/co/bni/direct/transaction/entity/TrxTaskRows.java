@@ -719,4 +719,25 @@ public final class TrxTaskRows {
             String note,
             LocalDateTime createdDt) {
     }
+
+    /**
+     * One addressee of a notification event, resolved PRODUCER-SIDE inside the workflow
+     * transaction so direct-notification never has to join back to TRX_TASK.
+     *
+     * <p>{@code userId} is CORP_USR.ID (the stable surrogate the notification rows are
+     * keyed on); {@code loginId} is CORP_USR.USER_ID, carried for support only and
+     * nullable - an actor whose candidate row was on another stage has no login id to
+     * offer here. {@code role} is MAKER / APPROVER / RELEASER, the contract's vocabulary.
+     */
+    public record NotificationRecipientRow(String userId, String loginId, String userName,
+                                           String role) {
+    }
+
+    /**
+     * The task badge: how many tasks the caller can act on right now, split by the kind of
+     * stage they are waiting on. Counted, never listed - this is polled every 30s per open
+     * browser tab.
+     */
+    public record TaskSummaryRow(int pendingApproval, int pendingRelease, int actionable) {
+    }
 }

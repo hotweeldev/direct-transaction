@@ -19,7 +19,13 @@ import id.co.bni.direct.transaction.integration.CoreTransferClient.TransferOutco
 import id.co.bni.direct.transaction.repository.mapper.ChargeMapper;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import id.co.bni.direct.transaction.entity.TrxTaskRows;
+import id.co.bni.direct.transaction.entity.EventOutboxRows;
+import com.fasterxml.jackson.databind.JsonNode;
+import id.co.bni.direct.transaction.repository.mapper.ExecutionOutboxMapper;
 import id.co.bni.direct.transaction.service.impl.CoreExecutionServiceImpl;
+import id.co.bni.direct.transaction.service.impl.NotificationOutbox;
 import id.co.bni.direct.transaction.service.impl.SimsemRefunder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -55,6 +61,8 @@ class CoreExecutionServiceImplTest {
     private CoreTransferClient coreTransferClient;
     private PlatformTransactionManager txManager;
     private SimsemPool simsemPool;
+    /** The outbox table the TRANSACTION_* verdict events land in. */
+    private ExecutionOutboxMapper outboxMapper;
     private CoreExecutionServiceImpl service;
 
     @BeforeEach
@@ -64,12 +72,15 @@ class CoreExecutionServiceImplTest {
         coreTransferClient = mock(CoreTransferClient.class);
         txManager = mock(PlatformTransactionManager.class);
         simsemPool = mock(SimsemPool.class);
+        outboxMapper = mock(ExecutionOutboxMapper.class);
         // requoteOnRelease() answers false by Mockito default, which is the shipped
         // behaviour: the charge the approvers saw is the charge that is booked.
         service = new CoreExecutionServiceImpl(trxTaskMapper, mock(ChargeMapper.class),
                 mock(ChargeService.class), mock(LimitService.class), transferMapper,
                 coreTransferClient, new TransferTypeProperties(), simsemPool,
-                new SimsemRefunder(coreTransferClient), txManager);
+                new SimsemRefunder(coreTransferClient),
+                new NotificationOutbox(outboxMapper, trxTaskMapper, new ObjectMapper()),
+                txManager);
         when(coreTransferClient.isEnabled()).thenReturn(true);
     }
 
@@ -1336,5 +1347,98 @@ class CoreExecutionServiceImplTest {
         assertThat(row.getValue().feeAmtValue()).isEqualTo("Rp2500");
         assertThat(row.getValue().accNoTo()).isNull();
         assertThat(row.getValue().benRefNo()).isNull();
+    }
+
+    // ---- TRANSACTION_* verdict events (notification contract sections 0 and 1) ----
+
+    private JsonNode verdictEvent(String expectedEventType) throws Exception {
+        ArgumentCaptor<EventOutboxRows.OutboxInsert> row =
+                ArgumentCaptor.forClass(EventOutboxRows.OutboxInsert.class);
+        verify(outboxMapper).insert(row.capture());
+        assertThat(row.getValue().eventType()).isEqualTo(expectedEventType);
+        assertThat(row.getValue().aggregateId()).isEqualTo(TASK);
+        return new ObjectMapper().readTree(row.getValue().payload());
+    }
+
+    private void stubVerdictRecipients() {
+        when(trxTaskMapper.findNotificationMaker(TASK)).thenReturn(
+                new TrxTaskRows.NotificationRecipientRow("CU1", "budi", "BUDI SANTOSO", "MAKER"));
+        when(trxTaskMapper.findNotificationActors(TASK, List.of("APPROVE", "RELEASE")))
+                .thenReturn(List.of(
+                        new TrxTaskRows.NotificationRecipientRow("CU2", "ani", "ANI", "APPROVER"),
+                        new TrxTaskRows.NotificationRecipientRow("CU9", "eka", "EKA", "RELEASER")));
+    }
+
+    @Test
+    void anExecutedVerdictNotifiesTheMakerTheApproverAndTheReleaser() throws Exception {
+        stubClaimable();
+        stubVerdictRecipients();
+        when(coreTransferClient.transfer("113179933", "1000533372", AMOUNT, "IDR", "pembayaran vendor"))
+                .thenReturn(new TransferOutcome(Status.SUCCESS, "907409", "PT MAJU JAYA"));
+
+        service.execute(TASK);
+
+        JsonNode payload = verdictEvent("TRANSACTION_EXECUTED");
+        assertThat(payload.get("recipients").findValuesAsText("userId"))
+                .containsExactly("CU1", "CU2", "CU9");
+        // Both id spaces travel: the surrogate and the login the UMAS token carries.
+        assertThat(payload.get("recipients").findValuesAsText("loginId"))
+                .containsExactly("budi", "ani", "eka");
+        assertThat(payload.get("status").asText()).isEqualTo("EXECUTED");
+        assertThat(payload.get("isError").asBoolean()).isFalse();
+        assertThat(payload.get("corpId").asText()).isEqualTo("CORP1");
+        assertThat(payload.get("refNo").asText()).isEqualTo("20260831100000228541");
+    }
+
+    /**
+     * The refusal path is the one worth pinning: TX-B is rolled back and the verdict is
+     * written by TX-C, so the notification has to be enqueued there too - with the
+     * verdict, not with the work that was undone.
+     */
+    @Test
+    void aRefusalNotifiesFailedFromTheVerdictTransaction() throws Exception {
+        stubClaimable();
+        stubVerdictRecipients();
+        when(coreTransferClient.transfer(anyString(), anyString(), any(), anyString(), any()))
+                .thenReturn(new TransferOutcome(Status.REFUSED, null, "Nomor rekening tidak valid."));
+
+        service.execute(TASK);
+
+        JsonNode payload = verdictEvent("TRANSACTION_FAILED");
+        assertThat(payload.get("isError").asBoolean()).isTrue();
+        assertThat(payload.get("status").asText()).isEqualTo("FAILED");
+    }
+
+    @Test
+    void aTimeoutNotifiesUnknown() throws Exception {
+        stubClaimable();
+        stubVerdictRecipients();
+        when(coreTransferClient.transfer(anyString(), anyString(), any(), anyString(), any()))
+                .thenReturn(new TransferOutcome(Status.UNKNOWN, null,
+                        "Core banking tidak menjawab tepat waktu."));
+
+        service.execute(TASK);
+
+        assertThat(verdictEvent("TRANSACTION_UNKNOWN").get("isError").asBoolean()).isTrue();
+    }
+
+    /** A lost double-execute claim ended nothing, so it announces nothing. */
+    @Test
+    void aLostClaimNotifiesNobody() {
+        when(trxTaskMapper.findTaskForExecution(TASK)).thenReturn(task("EXECUTING"));
+
+        service.execute(TASK);
+
+        verify(outboxMapper, never()).insert(any());
+    }
+
+    /** Neither does a laptop with the core hop switched off. */
+    @Test
+    void aDisabledCoreHopNotifiesNobody() {
+        when(coreTransferClient.isEnabled()).thenReturn(false);
+
+        service.execute(TASK);
+
+        verify(outboxMapper, never()).insert(any());
     }
 }

@@ -18,6 +18,11 @@ import id.co.bni.direct.transaction.integration.CoreTransferClient.Status;
 import id.co.bni.direct.transaction.integration.CoreTransferClient.TransferOutcome;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import id.co.bni.direct.transaction.entity.EventOutboxRows;
+import com.fasterxml.jackson.databind.JsonNode;
+import id.co.bni.direct.transaction.repository.mapper.ExecutionOutboxMapper;
+import id.co.bni.direct.transaction.service.impl.NotificationOutbox;
 import id.co.bni.direct.transaction.service.impl.ReconciliationServiceImpl;
 import id.co.bni.direct.transaction.service.impl.SimsemRefunder;
 import org.junit.jupiter.api.BeforeEach;
@@ -51,6 +56,7 @@ class ReconciliationServiceImplTest {
     private TrxTaskMapper trxTaskMapper;
     private TransferMapper transferMapper;
     private CoreTransferClient coreTransferClient;
+    private ExecutionOutboxMapper outboxMapper;
     private ReconciliationServiceImpl service;
 
     @BeforeEach
@@ -58,8 +64,10 @@ class ReconciliationServiceImplTest {
         trxTaskMapper = mock(TrxTaskMapper.class);
         transferMapper = mock(TransferMapper.class);
         coreTransferClient = mock(CoreTransferClient.class);
+        outboxMapper = mock(ExecutionOutboxMapper.class);
         service = new ReconciliationServiceImpl(trxTaskMapper, mock(LimitService.class), transferMapper, coreTransferClient,
                 new SimsemRefunder(coreTransferClient), new TransferTypeProperties(),
+                new NotificationOutbox(outboxMapper, trxTaskMapper, new ObjectMapper()),
                 mock(PlatformTransactionManager.class));
     }
 
@@ -294,5 +302,31 @@ class ReconciliationServiceImplTest {
         // No amount parsed: never a match.
         assertThat(ReconciliationServiceImpl.isLeg2Of(
                 new Posting(null, null, "X", "bayar vendor", null), task, "J1")).isFalse();
+    }
+
+    /**
+     * A reconciliation is the only path other than the execution seam that moves a task to
+     * a terminal status, so it owes the same TRANSACTION_* event - written inside the
+     * finalizing transaction, not after it.
+     */
+    @Test
+    void reconcilingToExecutedEnqueuesTheExecutedNotification() throws Exception {
+        stubStranded();
+        when(trxTaskMapper.findNotificationMaker(TASK)).thenReturn(
+                new TrxTaskRows.NotificationRecipientRow("CU1", "budi", "BUDI", "MAKER"));
+        when(coreTransferClient.inquireTransactions(SIMSEM, "01")).thenReturn(List.of(
+                posting("J2", "bayar vendor", "-10000000.00"),
+                leg1Credit()));
+        when(trxTaskMapper.reconcileToExecuted(eq(TASK), eq("J2"), anyString(), eq("actor")))
+                .thenReturn(1);
+
+        service.reconcile(COMPANY, TASK, "actor");
+
+        ArgumentCaptor<EventOutboxRows.OutboxInsert> row =
+                ArgumentCaptor.forClass(EventOutboxRows.OutboxInsert.class);
+        verify(outboxMapper).insert(row.capture());
+        assertThat(row.getValue().eventType()).isEqualTo("TRANSACTION_EXECUTED");
+        assertThat(new ObjectMapper().readTree(row.getValue().payload())
+                .get("recipients").findValuesAsText("userId")).containsExactly("CU1");
     }
 }

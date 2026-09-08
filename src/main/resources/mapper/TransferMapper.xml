@@ -187,9 +187,12 @@
         ORDER BY LONG_AMT_LMT
     </select>
 
-    <!-- AUTH_LMT_SCHEME_ID resolves to the required approval level; the join is LEFT so a
-         detail row pointing at no scheme means "any level", which the service stores as a
-         null APRV_LVL_CD. -->
+    <!-- AUTH_LMT_SCHEME_ID resolves to the required approval level. The join stays LEFT so
+         the service can SEE a detail row whose scheme is missing or null rather than have
+         the row disappear: a null aprvLvlCd means the approval limit scheme was never
+         configured, and TransferServiceImpl refuses the submit with NO_APRV_LVL_SCHEME.
+         It is NOT "any level" - reading it that way made every AP-role user an approval
+         candidate and wrote stages with a null APRV_LVL_CD. -->
     <select id="findBandSignatures" resultType="id.co.bni.direct.transaction.entity.TransferRows$MatrixSignatureRow">
         SELECT d.SEQ_NO          AS "seqNo",
                d.NO_USR          AS "noUsr",

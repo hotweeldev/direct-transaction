@@ -3,6 +3,10 @@ package id.co.bni.direct.transaction.service;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import id.co.bni.direct.transaction.entity.TrxTaskRows;
+import id.co.bni.direct.transaction.entity.EventOutboxRows.OutboxInsert;
+import com.fasterxml.jackson.databind.JsonNode;
 
 import id.co.bni.direct.transaction.dto.request.TaskRequests.ApproveTaskRequest;
 import id.co.bni.direct.transaction.dto.request.TaskRequests.RejectTaskRequest;
@@ -18,7 +22,9 @@ import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient;
 import id.co.bni.direct.transaction.integration.UmasAuthenticatorClient.Verification;
 import id.co.bni.direct.transaction.repository.mapper.TransferMapper;
 import id.co.bni.direct.transaction.repository.mapper.TrxTaskMapper;
+import id.co.bni.direct.transaction.repository.mapper.ExecutionOutboxMapper;
 import id.co.bni.direct.transaction.service.impl.ExecutionOutbox;
+import id.co.bni.direct.transaction.service.impl.NotificationOutbox;
 import id.co.bni.direct.transaction.service.impl.TaskApprovalServiceImpl;
 import id.co.bni.direct.transaction.service.impl.TransferServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
@@ -52,6 +58,8 @@ class TaskApprovalServiceImplTest {
     private UmasAuthenticatorClient authenticatorClient;
     private ExecutionService executionService;
     private ExecutionOutbox executionOutbox;
+    /** The outbox table behind BOTH event kinds; notification rows land here. */
+    private ExecutionOutboxMapper outboxMapper;
     private TaskApprovalServiceImpl service;
 
     @BeforeEach
@@ -62,11 +70,18 @@ class TaskApprovalServiceImplTest {
         // Mockito default: isKafkaMode() answers false, so every test runs sync mode
         // unless it stubs kafka mode explicitly.
         executionOutbox = mock(ExecutionOutbox.class);
+        outboxMapper = mock(ExecutionOutboxMapper.class);
+        // The REAL NotificationOutbox, not a mock: what these tests need to pin down is
+        // which recipients each transition resolves and that the row is written from
+        // inside the workflow callback, neither of which a mock can show.
+        NotificationOutbox notificationOutbox =
+                new NotificationOutbox(outboxMapper, trxTaskMapper, new ObjectMapper());
         // A mocked manager makes the TransactionTemplate run its callback with no real
         // transaction - the commit-before-execute ordering is structural, not asserted.
         service = new TaskApprovalServiceImpl(trxTaskMapper, mock(TransferMapper.class),
                 mock(LimitService.class), authenticatorClient,
-                executionService, executionOutbox, mock(PlatformTransactionManager.class), 50);
+                executionService, executionOutbox, notificationOutbox,
+                mock(PlatformTransactionManager.class), 50);
     }
 
     private static TaskRow task(String status, Integer currentStageSeq, long version) {
@@ -435,5 +450,153 @@ class TaskApprovalServiceImplTest {
         assertRefused("TASK_NOT_ACTIONABLE",
                 () -> service.reject(COMPANY, "actor", TASK, reject("ani")));
         verify(trxTaskMapper, never()).closeOpenStages(anyString(), anyString());
+    }
+
+    // ---- Notification events (contract sections 0 and 1) ----
+    //
+    // These assert the WORKFLOW side: which event a transition produces, and that the row
+    // is written by the same call that wrote the state change. The envelope itself is
+    // NotificationOutboxTest's subject.
+
+    private JsonNode notificationPayload(String expectedEventType) throws Exception {
+        ArgumentCaptor<OutboxInsert> row = ArgumentCaptor.forClass(OutboxInsert.class);
+        verify(outboxMapper).insert(row.capture());
+        assertThat(row.getValue().eventType()).isEqualTo(expectedEventType);
+        assertThat(row.getValue().aggregateId()).isEqualTo(TASK);
+        return new ObjectMapper().readTree(row.getValue().payload());
+    }
+
+    private static List<String> userIds(JsonNode payload) {
+        return payload.get("recipients").findValuesAsText("userId");
+    }
+
+    private void stubMaker() {
+        when(trxTaskMapper.findNotificationMaker(TASK)).thenReturn(
+                new TrxTaskRows.NotificationRecipientRow("CU1", "budi", "BUDI SANTOSO", "MAKER"));
+    }
+
+    @Test
+    void anApprovalThatOpensTheNextStageNotifiesThatStageAndTheMaker() throws Exception {
+        when(trxTaskMapper.findTask(COMPANY, TASK)).thenReturn(task("PENDING_APPROVAL", 1, 3));
+        when(trxTaskMapper.findStages(TASK)).thenReturn(List.of(
+                stage(1, "APPROVAL", 1, 0, "ACTIVE"),
+                stage(2, "APPROVAL", 1, 0, "WAITING"),
+                stage(3, "RELEASE", 1, 0, "WAITING")));
+        stubEligible(1);
+        stubMaker();
+        when(trxTaskMapper.findNotificationCandidates(TASK, 2)).thenReturn(List.of(
+                new TrxTaskRows.NotificationRecipientRow("CU3", "dewi", "DEWI", "APPROVER")));
+
+        service.approve(COMPANY, "actor", TASK, approve("ani"));
+
+        JsonNode payload = notificationPayload("TASK_APPROVED");
+        // Stage 2 is where the task now sits - not stage 1, which this approval closed.
+        assertThat(userIds(payload)).containsExactly("CU3", "CU1");
+        assertThat(payload.get("status").asText()).isEqualTo("PENDING_APPROVAL");
+        assertThat(payload.get("serviceName").asText()).isEqualTo("Transfer ke BNI");
+    }
+
+    @Test
+    void anApprovalShortOfTheRequiredCountNotifiesTheSameStageAgain() throws Exception {
+        when(trxTaskMapper.findTask(COMPANY, TASK)).thenReturn(task("PENDING_APPROVAL", 1, 0));
+        when(trxTaskMapper.findStages(TASK)).thenReturn(List.of(
+                stage(1, "APPROVAL", 2, 0, "ACTIVE"),
+                stage(2, "RELEASE", 1, 0, "WAITING")));
+        stubEligible(1);
+        stubMaker();
+        when(trxTaskMapper.findNotificationCandidates(TASK, 1)).thenReturn(List.of(
+                new TrxTaskRows.NotificationRecipientRow("CU3", "dewi", "DEWI", "APPROVER")));
+
+        service.approve(COMPANY, "actor", TASK, approve("ani"));
+
+        assertThat(userIds(notificationPayload("TASK_APPROVED"))).containsExactly("CU3", "CU1");
+    }
+
+    @Test
+    void aReleaseThatCompletesTheWorkflowNotifiesTheMakerOnly() throws Exception {
+        when(trxTaskMapper.findTask(COMPANY, TASK)).thenReturn(task("PENDING_RELEASE", 2, 5));
+        when(trxTaskMapper.findStages(TASK)).thenReturn(List.of(
+                stage(1, "APPROVAL", 1, 1, "DONE"),
+                stage(2, "RELEASE", 1, 0, "ACTIVE")));
+        stubEligible(2);
+        stubMaker();
+        when(executionService.execute(TASK))
+                .thenReturn(new ExecutionService.ExecutionResult("EXECUTED", null));
+
+        service.approve(COMPANY, "actor", TASK, approve("ani"));
+
+        JsonNode payload = notificationPayload("TASK_RELEASED");
+        assertThat(userIds(payload)).containsExactly("CU1");
+        assertThat(payload.get("status").asText()).isEqualTo("READY_TO_EXECUTE");
+        // The verdict event is the execution seam's job, not this transaction's.
+        verify(trxTaskMapper, never()).findNotificationActors(anyString(), any());
+    }
+
+    @Test
+    void aRejectNotifiesTheMakerAndEveryoneWhoActed() throws Exception {
+        when(trxTaskMapper.findTask(COMPANY, TASK)).thenReturn(task("PENDING_APPROVAL", 1, 2));
+        when(trxTaskMapper.findStages(TASK)).thenReturn(List.of(
+                stage(1, "APPROVAL", 2, 1, "ACTIVE")));
+        stubEligible(1);
+        stubMaker();
+        when(trxTaskMapper.findNotificationActors(TASK, List.of("APPROVE", "RELEASE", "REJECT")))
+                .thenReturn(List.of(new TrxTaskRows.NotificationRecipientRow(
+                        "CU2", "ani", "ANI LESTARI", "APPROVER")));
+
+        service.reject(COMPANY, "actor", TASK, reject("ani"));
+
+        JsonNode payload = notificationPayload("TASK_REJECTED");
+        assertThat(userIds(payload)).containsExactly("CU1", "CU2");
+        assertThat(payload.get("isError").asBoolean()).isTrue();
+        assertThat(payload.get("status").asText()).isEqualTo("REJECTED");
+    }
+
+    /**
+     * The atomicity the outbox exists for: the event row is written by the same call that
+     * made the state change, so it is inside the workflow transaction rather than after
+     * it. A claim lost to a concurrent actor writes neither.
+     */
+    @Test
+    void aLostClaimWritesNoNotification() {
+        when(trxTaskMapper.findTask(COMPANY, TASK)).thenReturn(task("PENDING_APPROVAL", 1, 0));
+        when(trxTaskMapper.findStages(TASK)).thenReturn(List.of(
+                stage(1, "APPROVAL", 1, 0, "ACTIVE"),
+                stage(2, "RELEASE", 1, 0, "WAITING")));
+        stubEligible(1);
+        when(trxTaskMapper.updateTaskProgress(eq(TASK), any(), anyString(), any(), anyString()))
+                .thenReturn(0);
+
+        assertThatThrownBy(() -> service.approve(COMPANY, "actor", TASK, approve("ani")))
+                .isInstanceOf(BusinessRuleException.class);
+
+        verify(outboxMapper, never()).insert(any());
+    }
+
+    // ---- The task badge (contract section 4) ----
+
+    @Test
+    void summaryAnswersTheCountsForTheCallerAndCompany() {
+        when(trxTaskMapper.findTaskSummary(COMPANY, "ani"))
+                .thenReturn(new TrxTaskRows.TaskSummaryRow(3, 1, 4));
+
+        var summary = service.summary(COMPANY, "ani");
+
+        assertThat(summary.pendingApproval()).isEqualTo(3);
+        assertThat(summary.pendingRelease()).isEqualTo(1);
+        assertThat(summary.actionable()).isEqualTo(4);
+        // A badge never builds the list behind it.
+        verify(trxTaskMapper, never()).findInbox(anyString(), anyString());
+    }
+
+    @Test
+    void summaryOfAnEmptyInboxIsAllZeroes() {
+        when(trxTaskMapper.findTaskSummary(COMPANY, "ani"))
+                .thenReturn(new TrxTaskRows.TaskSummaryRow(0, 0, 0));
+
+        var summary = service.summary(COMPANY, "ani");
+
+        assertThat(summary.pendingApproval()).isZero();
+        assertThat(summary.pendingRelease()).isZero();
+        assertThat(summary.actionable()).isZero();
     }
 }

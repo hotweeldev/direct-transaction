@@ -150,6 +150,7 @@ public class TransferServiceImpl implements TransferService {
     private final UmasAuthenticatorClient authenticatorClient;
     private final ExecutionService executionService;
     private final ExecutionOutbox executionOutbox;
+    private final NotificationOutbox notificationOutbox;
     private final TransferTypeProperties transferTypeProperties;
     private final TransactionTemplate submitTransaction;
 
@@ -163,6 +164,7 @@ public class TransferServiceImpl implements TransferService {
                                UmasAuthenticatorClient authenticatorClient,
                                ExecutionService executionService,
                                ExecutionOutbox executionOutbox,
+                               NotificationOutbox notificationOutbox,
                                TransferTypeProperties transferTypeProperties,
                                PlatformTransactionManager transactionManager) {
         this.transferMapper = transferMapper;
@@ -175,6 +177,7 @@ public class TransferServiceImpl implements TransferService {
         this.authenticatorClient = authenticatorClient;
         this.executionService = executionService;
         this.executionOutbox = executionOutbox;
+        this.notificationOutbox = notificationOutbox;
         this.transferTypeProperties = transferTypeProperties;
         this.submitTransaction = new TransactionTemplate(transactionManager);
     }
@@ -450,6 +453,40 @@ public class TransferServiceImpl implements TransferService {
                     .findFirst()
                     .orElse(bands.get(bands.size() - 1));
             signatures = transferMapper.findBandSignatures(band.id());
+
+            // The band must actually DESCRIBE a workflow. Two ways a half-configured
+            // matrix used to slip through here, both of them leaving a multi-user
+            // company's task with no determined approval direction:
+            //
+            //   * NO SIGNATURE ROWS at all. This used to fall through to
+            //     PENDING_RELEASE - "nothing to approve, straight to release" - which
+            //     for a multi-user company silently skips approval altogether. A
+            //     company whose band names no signatory has not decided that the
+            //     transfer needs no approval; it has not finished configuring the band.
+            //   * A SIGNATURE WITH NO APPROVAL LEVEL. findBandSignatures LEFT JOINs
+            //     AUTH_LMT_SCHEME, so a detail row whose AUTH_LMT_SCHEME_ID is null - or
+            //     points at a scheme the admin never created - comes back with a null
+            //     aprvLvlCd. selectApprovalCandidates then had nothing to match on, so
+            //     EVERY user holding an AP role became an approval candidate and the
+            //     stage was written with a null APRV_LVL_CD. That is not "any level is
+            //     fine", it is "the level was never configured", and guessing at it is
+            //     how a transfer reached an approver who was never meant to see it.
+            //
+            // Both are admin misconfiguration, so both are refused at submit with a
+            // message that names what to go and configure, in the NO_MATRIX style.
+            if (signatures.isEmpty()) {
+                throw new BusinessRuleException("NO_MATRIX_SIGNATURE",
+                        "Matriks persetujuan untuk nominal ini belum memiliki penanda tangan. "
+                                + "Lengkapi pengaturan matriks persetujuan perusahaan Anda.");
+            }
+            for (MatrixSignatureRow signature : signatures) {
+                if (signature.aprvLvlCd() == null) {
+                    throw new BusinessRuleException("NO_APRV_LVL_SCHEME",
+                            "Skema limit persetujuan (approval limit scheme) untuk matriks ini "
+                                    + "belum diatur, sehingga tingkat persetujuan transaksi tidak "
+                                    + "dapat ditentukan. Hubungi administrator perusahaan Anda.");
+                }
+            }
         }
 
         // h2. CANDIDATE MATERIALIZATION - the eligible-user set is FROZEN at submit (see
@@ -492,12 +529,12 @@ public class TransferServiceImpl implements TransferService {
             // event pipeline (kafka), where the outbox row is written below.
             status = executionOutbox.isKafkaMode() ? "QUEUED" : "READY_TO_EXECUTE";
             currentStageSeq = null;
-        } else if (approvalStages > 0) {
-            status = "PENDING_APPROVAL";
-            currentStageSeq = 1;
         } else {
-            // A band with no signature rows: nothing to approve, straight to release.
-            status = "PENDING_RELEASE";
+            // Multi-user always has at least one APPROVAL stage: the NO_MATRIX_SIGNATURE
+            // guard above refuses an empty band, so approvalStages > 0 here. There is
+            // deliberately no zero-signature branch any more - it used to send the task
+            // straight to PENDING_RELEASE and skip approval.
+            status = "PENDING_APPROVAL";
             currentStageSeq = 1;
         }
 
@@ -549,10 +586,15 @@ public class TransferServiceImpl implements TransferService {
             // The final RELEASE stage every non-single-user task carries. The candidate
             // rows ARE the enforcement now: eligibility at approve time reads only the
             // frozen set, never the group option again.
+            //
+            // Always WAITING: an approval stage always precedes it now that a band with
+            // no signatures is refused, so the release can never be the active stage at
+            // submit. Its own APRV_LVL_CD is null by design - a release is not levelled -
+            // which is why the column stays nullable even though an APPROVAL stage's
+            // level must not be.
             trxTaskMapper.insertStage(new TrxTaskRows.StageInsert(
                     newId(), taskId, seq, "RELEASE", null, "1", null, 1,
-                    approvalStages == 0 ? "ACTIVE" : "WAITING",
-                    actor));
+                    "WAITING", actor));
             insertCandidates(taskId, seq, releaseCandidates, actor);
         }
 
@@ -569,6 +611,19 @@ public class TransferServiceImpl implements TransferService {
             executionOutbox.enqueueExecutionRequested(taskId, refNo, companyId);
         }
 
+        // TASK_SUBMITTED for the candidates of the stage that is now ACTIVE, written in
+        // THIS transaction (see NotificationOutbox) - the candidate rows it resolves from
+        // are the ones inserted a few lines above, uncommitted and visible to this
+        // session, which is exactly the set that was frozen for this task.
+        //
+        // Not emitted on the single-user path: there is no stage and therefore nobody to
+        // tell. That maker hears about the transfer through its TRANSACTION_* verdict.
+        if (!singleUser) {
+            notificationOutbox.taskSubmitted(new NotificationOutbox.NotifiableTask(
+                    taskId, companyId, refNo, menuName(menuCd, srvcCd), srvcCd,
+                    amount, currency, status), currentStageSeq);
+        }
+
         log.info("Transfer task submitted: taskId={} refNo={} status={} stages={}",
                 taskId, refNo, status, singleUser ? 0 : approvalStages + 1);
 
@@ -581,9 +636,17 @@ public class TransferServiceImpl implements TransferService {
 
     /**
      * The frozen candidate set of one APPROVAL stage. Filters, in order: the workflow
-     * role must contain AP; the stage's level must match when it names one (null = any
-     * level); the user's group must satisfy the stage's USR_GRP_OPT; and the MAKER IS
-     * EXCLUDED - a maker never approves their own task, whatever roles they hold.
+     * role must contain AP; the user's level must EQUAL the stage's level; the user's
+     * group must satisfy the stage's USR_GRP_OPT; and the MAKER IS EXCLUDED - a maker
+     * never approves their own task, whatever roles they hold.
+     *
+     * <p>A null stage level is NOT a wildcard. It used to be read as "any level", which
+     * turned an unconfigured approval limit scheme into "everyone with an AP role may
+     * approve" - the defect this guard closes. The submit path now refuses such a
+     * signature outright (NO_APRV_LVL_SCHEME) so this can no longer be reached from
+     * there; the equality below keeps the next caller from re-opening it, matching no
+     * one instead, which surfaces as NO_ELIGIBLE_APPROVER rather than as a silent
+     * over-broad set.
      * (Legacy's admin module lets a checker approve their own maintenance request; for
      * transactions the safer reading is exclusion - flagged for business confirmation.)
      */
@@ -592,8 +655,8 @@ public class TransferServiceImpl implements TransferService {
                                                            MakerRow maker) {
         return dedupeByUserId(users.stream()
                 .filter(u -> u.wfRoleCd() != null && u.wfRoleCd().contains("AP"))
-                .filter(u -> signature.aprvLvlCd() == null
-                        || signature.aprvLvlCd().equals(u.aprvLvlCd()))
+                .filter(u -> signature.aprvLvlCd() != null
+                        && signature.aprvLvlCd().equals(u.aprvLvlCd()))
                 .filter(u -> matchesGroupOption(signature.usrGrpOpt(),
                         signature.corpUsrGrpId(), maker.groupId(), u.groupId()))
                 .filter(u -> !u.corpUserId().equals(maker.corpUserId()))
